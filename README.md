@@ -1,18 +1,88 @@
 # Figma listen
 
-A local, headless MCP companion to the standard Figma MCP. Subscribe to comments in the parts of a Figma project your agent is working on, optionally filtered by `#bot`.
+**A companion to the official Figma MCP for reviewing designs with your agent.**
 
-**v1 polls Figma's REST API and delivers events over MCP stdio.** No webhook, public URL, Figma plugin, or hosted service is required. Figma listen never posts comments, reacts, changes designs, or starts an agent. The receiving agent decides what to do.
+Your agent updates a design in Figma and gives you a link to check it over in the app. It can then subscribe to comments on the files it's working on, so you can leave feedback directly on the design. For agents that support event subscriptions, Figma listen immediately forwards each comment it detects, letting you keep the review conversation in Figma.
 
-**Client compatibility:** ordinary MCP clients can use the subscription and retrieval tools. Push delivery implements the **experimental MCP Events draft**, requiring a host that sends `events/stream` and handles its notifications. A working stdio connection does not establish automatic agent wakeups. Codex automatic push/wakeup support has **not been established**; tool retrieval works during an active agent session. This release does not make an idle Codex agent autonomously respond to comments.
+## Setup
 
-## Run v1
+You'll need Node.js **20.19 or newer** and npm.
 
-Requires Node.js **20.19 or newer** and npm. The GitHub release is runnable now; this package has not yet been published to the npm registry.
+### 1. Generate an access token
+
+In Figma, go to **Settings > Security > Personal access tokens > Generate new token**.
+
+- Give it a name, such as **Figma listen**.
+- Set the expiration to **90 days**.
+- Give it **all the read scopes**.
+
+Save your token by running this in your terminal, then paste it into the hidden prompt:
+
+```sh
+npx -y github:mikekelly/figma-listen#v1.1.0 auth
+```
+
+If you already export `FIGMA_ACCESS_TOKEN`, you can use that instead of saving a token with `auth`.
+
+<a id="configure-codex"></a>
+
+### 2. Install the MCP
+
+Ask your agent:
+
+> Add the following Figma listen MCP server to my Codex config at `~/.codex/config.toml`.
+
+```toml
+[mcp_servers.figma_listen]
+command = "npx"
+args = ["-y", "github:mikekelly/figma-listen#v1.1.0"]
+env_vars = ["FIGMA_ACCESS_TOKEN"]
+startup_timeout_sec = 120
+```
+
+Check that authentication is working:
+
+```sh
+npx -y github:mikekelly/figma-listen#v1.1.0 doctor
+```
+
+Once connected, ask your agent to subscribe to the files you're reviewing. For example:
+
+> Use Figma listen to subscribe to comments containing #bot in this Figma file. Include replies to those threads, and check for feedback while we work. Use the official Figma MCP for the design work.
+
+See [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) for more configuration options.
+
+## Notification support
+
+Figma listen checks for new comments on a **three-second target interval**, subject to request pacing and Figma's rate limits. It sends notifications as soon as polling detects a matching comment.
+
+Automatic notifications require an agent host that implements the experimental MCP Events extension. **Codex automatic push/wakeup support has not been established.** Ordinary MCP clients can use the subscription and retrieval tools during an active agent session; installing this server alone does not make an idle agent respond to comments.
+
+Figma listen runs locally and polls Figma's REST API, delivering events over MCP stdio. It observes comments and replies; the agent uses the official Figma MCP for design work and decides how to act on feedback.
+
+## Authentication details
+
+The `auth` command validates your token and saves it in macOS Keychain, Windows Credential Manager, or Linux Secret Service. Linux requires an available Secret Service; environment authentication also works without the optional keyring dependency.
+
+The `FIGMA_ACCESS_TOKEN` environment variable takes precedence over a saved credential. Figma listen uses the environment token without copying it into its config or state files. `logout` removes the saved credential and leaves environment configuration alone. When your token expires, replace the environment value or run `auth` again.
+
+All available read scopes work. If you prefer to select only the scopes used by Figma listen:
+
+| Scope | Used for |
+| --- | --- |
+| `current_user:read` | Authentication check and binding local state to your Figma account |
+| `file_comments:read` | Reading comments and replies |
+| `file_content:read` | Page/frame subscriptions: mapping comment anchors into the document tree |
+| `folders:read` | Discovering files in folders and teams |
+
+Access is limited to resources visible to the token's account. The official Figma MCP's OAuth credentials are managed separately and are not reused by this server.
+
+## Other ways to run
+
+The GitHub release is runnable through `npx`; the package has not yet been published to the npm registry.
 
 ```sh
 npx -y github:mikekelly/figma-listen#v1.1.0 --help
-npx -y github:mikekelly/figma-listen#v1.1.0 doctor
 ```
 
 With no subcommand, `figma-listen` starts the MCP server. Help, version, and doctor output go to stdout; while serving MCP, stdout contains only protocol messages and diagnostics go to stderr.
@@ -29,37 +99,7 @@ node dist/cli.js
 
 `npm ci` builds the TypeScript source. The [v1.1.0 release](https://github.com/mikekelly/figma-listen/releases/tag/v1.1.0) also includes a compiled npm tarball.
 
-## Authentication
-
-Create a Figma personal access token under **Settings → Security → Personal access tokens**. Name it “Figma listen”, choose your expiration (for example 90 days), and enable:
-
-| Scope | Used for |
-| --- | --- |
-| `current_user:read` | Authentication check and binding local state to your Figma account |
-| `file_comments:read` | Reading comments and replies |
-| `file_content:read` | Page/frame subscriptions: mapping comment anchors into the document tree |
-| `folders:read` | Discovering files in folders and teams |
-
-A token with all available read scopes works. No write scopes are needed. Access is limited to resources visible to the token's account. The Figma MCP's OAuth credentials are managed separately and are not reused by this server.
-
-Choose either:
-
-1. **Environment:** export `FIGMA_ACCESS_TOKEN` in your usual credentials setup. Figma listen uses it without copying it into its config or state files. Run `doctor` from a shell that already has this variable.
-2. **Saved credential:** run `npx -y github:mikekelly/figma-listen#v1.1.0 auth`. Paste the token into the hidden terminal prompt. It is validated, then saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. Linux requires an available Secret Service; environment auth also works without the optional keyring dependency.
-
-The environment variable takes precedence over the saved credential. `logout` removes the saved credential and leaves environment configuration alone. When your token expires, replace the environment value or run `auth` again.
-
-## Configure Codex
-
-Add this MCP server to your Codex config:
-
-```toml
-[mcp_servers.figma_listen]
-command = "npx"
-args = ["-y", "github:mikekelly/figma-listen#v1.1.0"]
-env_vars = ["FIGMA_ACCESS_TOKEN"]
-startup_timeout_sec = 120
-```
+## Advanced Codex configuration
 
 `env_vars` forwards the token from the **Codex process's environment**. A desktop app launched outside your terminal may not inherit `.zshrc`; saved credential authentication avoids that dependency. Do not put your token into command arguments or checked-in config.
 
@@ -70,12 +110,6 @@ Use a separate state directory for each simultaneously connected host or Codex s
 ```toml
 args = ["-y", "github:mikekelly/figma-listen#v1.1.0", "--state-dir", "/absolute/path/to/session-state"]
 ```
-
-Then ask the agent:
-
-> Subscribe to comments containing #bot in Figma file FILE_KEY using Figma listen. Check for new events while we work, and use the standard Figma MCP for any follow-up work I request.
-
-That uses tool retrieval; it does not schedule or wake the agent after the session ends. See [Codex MCP configuration](https://developers.openai.com/codex/mcp).
 
 ## Subscriptions
 
