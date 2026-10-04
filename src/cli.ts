@@ -20,7 +20,7 @@ Usage: figma-listen [auth|logout|doctor] [options]
 
 Options:
   --state-dir PATH      Persistent state directory (one process per directory)
-  --poll-interval SECS  Delay between polling cycles; default 60, minimum 10
+  --poll-interval SECS  Desired resource polling interval; default 3, minimum 1
   --request-interval MS Minimum spacing between Figma requests; default 2000
   --help                Show this help
   --version             Print version
@@ -42,9 +42,9 @@ async function main(): Promise<void> {
     await (await credentialEntry()).deleteCredential();
     process.stderr.write('Saved token removed. FIGMA_ACCESS_TOKEN, if set, still takes precedence.\n'); return;
   }
-  const interval = Number(values['poll-interval'] ?? 60) * 1000;
+  const interval = Number(values['poll-interval'] ?? 3) * 1000;
   const spacing = Number(values['request-interval'] ?? 2000);
-  if (!Number.isFinite(interval) || interval < 10000 || interval > 86400000) throw new Error('--poll-interval must be between 10 and 86400 seconds');
+  if (!Number.isFinite(interval) || interval < 1000 || interval > 86400000) throw new Error('--poll-interval must be between 1 and 86400 seconds');
   if (!Number.isFinite(spacing) || spacing < 0 || spacing > 60000) throw new Error('--request-interval must be between 0 and 60000 milliseconds');
   const directory = resolve(values['state-dir'] ?? process.env.FIGMA_LISTEN_STATE_DIR ??
     join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'figma-listen'));
@@ -58,6 +58,7 @@ async function main(): Promise<void> {
       process.stdout.write(JSON.stringify({ version: VERSION, authenticated: true, user_id: user.id,
         token_source: process.env.FIGMA_ACCESS_TOKEN?.trim() ? 'environment' : 'credential_store',
         state_directory: directory, poll_interval_ms: interval, request_interval_ms: spacing,
+        polling_scheduler: 'FIFO; one pending or running job per resource',
         required_scopes: ['current_user:read','file_comments:read'],
         optional_scopes: ['file_content:read','folders:read'],
         push_compatibility: 'Requires a host implementing the draft MCP Events extension; not verified for Codex.' }, null, 2) + '\n');

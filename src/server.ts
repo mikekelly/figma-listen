@@ -3,7 +3,7 @@ import * as z from 'zod/v4';
 import { ListenEngine } from './engine.js';
 import { eventName, eventPayloadSchema, subscriptionSchema } from './schema.js';
 
-export const VERSION = '1.0.1';
+export const VERSION = '1.1.0';
 const catalog = () => ({ events: [{ name: eventName,
   description: 'A new Figma comment or reply, observed by REST polling. Filter by scope and optionally a hashtag.',
   delivery: ['push', 'poll'], inputSchema: z.toJSONSchema(subscriptionSchema, { io: 'input' }),
@@ -55,6 +55,7 @@ export function createServer(engine: ListenEngine): McpServer {
     args => engine.read(args.subscription_id, args.cursor, args.max_events));
   tool('listen_status', 'Report server capabilities, polling state, retention, and client compatibility limitations.',
     z.object({}).strict(), () => ({ version: VERSION, poll_interval_ms: engine.interval,
+      polling: engine.pollingStatus(),
       active_subscriptions: engine.subscriptions().length, buffered_events: engine.store.state.events.length,
       transport: 'stdio', upstream: 'Figma REST polling', reactions: false,
       supported_events: [eventName], retention_days: 7, max_buffered_events: 10000,

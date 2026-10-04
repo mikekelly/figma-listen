@@ -5,6 +5,7 @@ import { FigmaError, indexNodes, type FigmaSource } from './figma.js';
 import { canonical, eventName, subscriptionSchema, tagsIn,
   type Comment, type EventOccurrence, type Subscription, type SubscriptionArguments } from './schema.js';
 import type { StateStore } from './store.js';
+import { ResourceQueue } from './queue.js';
 
 export class ListenError extends ProtocolError {
   constructor(message: string, code = -32602) { super(code, message); }
@@ -18,14 +19,18 @@ export class ListenEngine extends EventEmitter {
   private timer?: NodeJS.Timeout;
   private stopped = false;
   private closing?: Promise<void>;
-  private failures = 0;
+  private started = false;
+  private pulsePending?: Promise<void>;
+  private queue = new ResourceQueue();
+  private retries = new Map<string, { failures: number; at: number }>();
   private denied = new Set<string>();
   private streams = new Map<string, number>();
-  private discoveries = new Map<string, { at: number; keys: string[]; warnings: string[]; names: Map<string, string> }>();
+  private discoveries = new Map<string, { at: number; keys: string[]; warnings: string[] }>();
+  private fileNames = new Map<string, string>();
   constructor(readonly store: StateStore, private readonly figma: FigmaSource, readonly options: {
     pollIntervalMs?: number; discoveryIntervalMs?: number; retentionMs?: number; maxEvents?: number;
   } = {}) { super(); this.setMaxListeners(100); }
-  get interval(): number { return this.options.pollIntervalMs ?? 60000; }
+  get interval(): number { return this.options.pollIntervalMs ?? 3000; }
   private serialized<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.tail.then(operation); this.tail = result.catch(() => {}); return result;
   }
@@ -57,7 +62,7 @@ export class ListenEngine extends EventEmitter {
   async unsubscribe(id: string): Promise<void> {
     await this.serialized(async () => {
       this.store.state.subscriptions = this.store.state.subscriptions.filter(s => s.id !== id);
-      this.discoveries.delete(id);
+      this.removeUnusedDiscoveries();
       await this.store.save();
       this.emit('unsubscribe', id);
     });
@@ -72,7 +77,7 @@ export class ListenEngine extends EventEmitter {
       const sub = this.store.state.subscriptions.find(s => s.id === id);
       if (!remaining && sub?.source === 'stream') {
         this.store.state.subscriptions = this.store.state.subscriptions.filter(s => s.id !== id);
-        this.discoveries.delete(id); await this.store.save(); this.emit('unsubscribe', id);
+        this.removeUnusedDiscoveries(); await this.store.save(); this.emit('unsubscribe', id);
       }
     });
   }
@@ -132,112 +137,206 @@ export class ListenEngine extends EventEmitter {
       state.droppedThrough = state.events.shift()!.sequence;
     }
   }
-  async tick(): Promise<void> { return this.serialized(() => this.poll()); }
-  private async poll(): Promise<void> {
-    if (this.stopped) return;
-    this.store.state.subscriptions = this.store.state.subscriptions.filter(s =>
-      this.streams.has(s.id) || !s.expiresAt || Date.parse(s.expiresAt) > Date.now());
-    const subscriptions = this.store.state.subscriptions;
-    const names = new Map<string, string>();
-    const files = new Set<string>();
-    let failure: Error | undefined;
-    for (const subscription of subscriptions) {
-      try {
-        let discovery = this.discoveries.get(subscription.id);
-        if (!discovery || Date.now() - discovery.at > (this.options.discoveryIntervalMs ?? 300000)) {
-          const result = await this.figma.discover(subscription.arguments.scope);
-          discovery = { at: Date.now(), keys: result.files.map(f => f.key), warnings: result.warnings,
-            names: new Map(result.files.filter(f => f.name).map(f => [f.key, f.name!])) };
-          this.discoveries.set(subscription.id, discovery);
-        }
-        subscription.coverage.file_keys = discovery.keys;
-        subscription.coverage.warnings = [...discovery.warnings];
-        subscription.coverage.complete = discovery.warnings.length === 0;
-        subscription.coverage.excluded_unanchored_comments = 0;
-        delete subscription.coverage.last_error;
-        for (const key of discovery.keys) files.add(key);
-        for (const [key, name] of discovery.names) names.set(key, name);
-      } catch (error) {
-        failure = error instanceof Error ? error : new Error('Discovery failed');
-        subscription.coverage.complete = false;
-        subscription.coverage.last_error = failure.message;
-        // Do not claim old discovery is current, or deliver buffered events from this scope.
-        subscription.coverage.file_keys = [];
+  private scopeKey(scope: SubscriptionArguments['scope']): string { return canonical(scope); }
+  private removeUnusedDiscoveries(): void {
+    const active = new Set(this.store.state.subscriptions.map(s => this.scopeKey(s.arguments.scope)));
+    for (const key of this.discoveries.keys()) if (!active.has(key)) this.discoveries.delete(key);
+  }
+  private forFile(key: string): Subscription[] {
+    return this.store.state.subscriptions.filter(s => {
+      const scope = s.arguments.scope;
+      return 'file_key' in scope ? scope.file_key === key : s.coverage.file_keys.includes(key);
+    });
+  }
+  pollingStatus(): Record<string, unknown> {
+    return { desired_interval_ms: this.interval, request_spacing_ms: this.figma.requestIntervalMs ?? null,
+      scheduler: 'FIFO; one pending or running job per resource', ...this.queue.status(),
+      upstream_requests: this.figma.requestStatus?.() ?? null };
+  }
+  private enqueue(key: string, operation: () => Promise<void>, failed: (error: Error) => Promise<void>): void {
+    if (this.stopped || (this.retries.get(key)?.at ?? 0) > Date.now()) return;
+    void this.queue.enqueue(key, async () => {
+      if (this.stopped) return;
+      try { await operation(); this.retries.delete(key); }
+      catch (cause) {
+        if (this.stopped) return;
+        const error = cause instanceof Error ? cause : new Error('Polling failed');
+        const failures = (this.retries.get(key)?.failures ?? 0) + 1;
+        const retryAfter = error instanceof FigmaError ? error.retryAfterMs : 0;
+        this.retries.set(key, { failures, at: Date.now() + Math.max(retryAfter,
+          Math.min(900000, this.interval * 2 ** Math.min(failures, 8))) });
+        try { await failed(error); } finally { this.emit('pollError', error); }
+        throw error;
       }
-    }
-    for (const key of files) {
-      if (this.stopped) break;
-      const interested = subscriptions.filter(s => s.coverage.file_keys.includes(key));
-      try {
-        const comments = await this.figma.comments(key);
-        this.denied.delete(key);
-        const known = new Set(this.store.state.seen[key] ?? []);
-        const fresh = [...new Map(comments.filter(c => !known.has(c.id)).map(c => [c.id, c])).values()]
-          .sort((a,b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
-        if (new Set([...known, ...fresh.map(c => c.id)]).size > 100000) throw new Error(
-          'Observed comment limit (100000 per file) reached; use a new state directory');
-        const byId = new Map(comments.map(c => [c.id, c]));
-        const needsIndex = interested.some(s => s.arguments.scope.kind === 'page' || s.arguments.scope.kind === 'frame');
-        let index: ReturnType<typeof indexNodes> | undefined;
-        if (needsIndex && fresh.some(c => interested.some(s => Date.parse(c.created_at) >= Date.parse(s.createdAt)))) {
-          const file = await this.figma.file(key);
-          index = indexNodes(file.document); names.set(key, file.name);
-        }
-        for (const comment of fresh) {
-          let root: Comment = comment;
-          const visited = new Set([root.id]);
-          while (root.parent_id && byId.has(root.parent_id) && !visited.has(root.parent_id)) {
-            root = byId.get(root.parent_id)!; visited.add(root.id);
-          }
-          const nodeId = root.client_meta?.node_id ?? null;
-          const anchor = nodeId ? index?.get(nodeId) : undefined;
-          if (needsIndex && (!nodeId || !anchor)) for (const sub of interested) {
-            if (Date.parse(comment.created_at) < Date.parse(sub.createdAt)) continue;
-            if (sub.arguments.scope.kind === 'page' || sub.arguments.scope.kind === 'frame') {
-              sub.coverage.excluded_unanchored_comments++;
-              sub.coverage.complete = false;
-            }
-          }
-          if (interested.some(s => Date.parse(comment.created_at) >= Date.parse(s.createdAt))) {
-            const sequence = ++this.store.state.sequence;
-            this.store.state.events.push({
-              eventId: `figma_${createHash('sha256').update(`${key}:${comment.id}`).digest('hex')}`,
-              name: eventName, timestamp: comment.created_at, sequence, observedAt: new Date().toISOString(),
-              data: { file_key: key, ...(names.has(key) ? { file_name: names.get(key) } : {}),
-                comment_id: comment.id, thread_id: root.id, parent_id: comment.parent_id || null,
-                text: comment.message, author: { id: comment.user.id,
-                  ...(typeof comment.user.handle === 'string' ? { handle: comment.user.handle } : {}) }, created_at: comment.created_at,
-                resolved_at: comment.resolved_at || null, node_id: nodeId, page_id: anchor?.pageId ?? null,
-                ancestor_ids: anchor?.ancestors ?? [], thread_has_tag: tagsIn(root.message),
-                url: `https://www.figma.com/design/${encodeURIComponent(key)}?${new URLSearchParams({
-                  ...(nodeId ? { 'node-id': nodeId } : {}), 'comment-id': comment.id }).toString()}` },
-            });
-          }
-          known.add(comment.id);
-        }
-        this.store.state.seen[key] = [...known];
-        for (const sub of interested) {
-          sub.coverage.last_success_at = new Date().toISOString();
-          if (sub.coverage.excluded_unanchored_comments) sub.coverage.warnings.push(
-            'Some comments could not be mapped to a page/frame and were excluded from that scoped subscription.');
-        }
-        // Commit the event log and seen IDs together before notifying a client.
-        this.prune(); await this.store.save(); this.emit('events');
-      } catch (error) {
-        failure = error instanceof Error ? error : new Error('Polling failed');
+    });
+  }
+  private enqueueFile(key: string): void {
+    this.enqueue(`comments:${key}`, () => this.pollFile(key), async error => {
+      await this.serialized(async () => {
         if (error instanceof FigmaError && [401,403,404].includes(error.status)) this.denied.add(key);
-        for (const sub of interested) { sub.coverage.complete = false; sub.coverage.last_error = failure.message; }
-        if (error instanceof FigmaError && error.status === 429) break;
+        for (const sub of this.forFile(key)) { sub.coverage.complete = false; sub.coverage.last_error = error.message; }
+        await this.store.save();
+      });
+    });
+  }
+  private enqueueDiscovery(scope: SubscriptionArguments['scope']): void {
+    const scopeKey = this.scopeKey(scope);
+    this.enqueue(`discovery:${scopeKey}`, async () => {
+      if (!this.store.state.subscriptions.some(s => this.scopeKey(s.arguments.scope) === scopeKey)) return;
+      const result = await this.figma.discover(scope);
+      await this.serialized(async () => {
+        if (this.stopped) return;
+        const interested = this.store.state.subscriptions.filter(s => this.scopeKey(s.arguments.scope) === scopeKey);
+        if (!interested.length) return;
+        const keys = [...new Set(result.files.map(f => f.key))];
+        this.discoveries.set(scopeKey, { at: Date.now(), keys, warnings: result.warnings });
+        for (const file of result.files) if (file.name) this.fileNames.set(file.key, file.name);
+        for (const sub of interested) {
+          sub.coverage.file_keys = keys; sub.coverage.warnings = [...result.warnings];
+          sub.coverage.complete = result.warnings.length === 0; delete sub.coverage.last_error;
+        }
+        await this.store.save();
+        for (const key of keys) this.enqueueFile(key);
+      });
+    }, async error => {
+      await this.serialized(async () => {
+        this.discoveries.delete(scopeKey);
+        for (const sub of this.store.state.subscriptions) if (this.scopeKey(sub.arguments.scope) === scopeKey) {
+          sub.coverage.complete = false; sub.coverage.last_error = error.message;
+          sub.coverage.file_keys = [];
+        }
+        await this.store.save();
+      });
+    });
+  }
+  private pulse(): Promise<void> {
+    if (this.pulsePending) return this.pulsePending;
+    const operation = this.serialized(async () => {
+      if (this.stopped) return;
+      const active = this.store.state.subscriptions.filter(s =>
+        this.streams.has(s.id) || !s.expiresAt || Date.parse(s.expiresAt) > Date.now());
+      const changed = active.length !== this.store.state.subscriptions.length;
+      this.store.state.subscriptions = active;
+      const previousDropped = this.store.state.droppedThrough;
+      this.prune();
+      this.removeUnusedDiscoveries();
+      const files = new Set<string>();
+      const scopes = new Map<string, SubscriptionArguments['scope']>();
+      for (const sub of active) {
+        const scope = sub.arguments.scope;
+        if ('file_key' in scope) {
+          if (!sub.coverage.file_keys.includes(scope.file_key)) {
+            sub.coverage.file_keys = [scope.file_key]; sub.coverage.warnings = []; sub.coverage.complete = true;
+          }
+          files.add(scope.file_key);
+        } else {
+          const key = this.scopeKey(scope);
+          const discovery = this.discoveries.get(key);
+          if (!discovery || Date.now() - discovery.at > (this.options.discoveryIntervalMs ?? 300000)) scopes.set(key, scope);
+          if (discovery) {
+            sub.coverage.file_keys = [...discovery.keys];
+            sub.coverage.warnings = [...discovery.warnings];
+            sub.coverage.complete = discovery.warnings.length === 0 && !sub.coverage.last_error;
+            for (const file of discovery.keys) files.add(file);
+          }
+        }
       }
+      for (const scope of scopes.values()) this.enqueueDiscovery(scope);
+      for (const key of files) this.enqueueFile(key);
+      if (changed || previousDropped !== this.store.state.droppedThrough) await this.store.save();
+    });
+    this.pulsePending = operation;
+    void operation.finally(() => { if (this.pulsePending === operation) this.pulsePending = undefined; }).catch(() => {});
+    return operation;
+  }
+  /** Manual polling: enqueue current resources and wait for outstanding work to drain. */
+  async tick(): Promise<void> {
+    const errors: Error[] = [];
+    const record = (error: Error) => errors.push(error);
+    this.on('pollError', record);
+    try {
+      await this.pulse(); await this.queue.idle();
+      if (errors.length) throw errors[errors.length - 1];
+    } finally { this.off('pollError', record); }
+  }
+  private async pollFile(key: string): Promise<void> {
+    if (!this.forFile(key).length) return;
+    // Network waits never hold the state mutation lock. Subscription tools remain responsive.
+    const comments = await this.figma.comments(key);
+    const current = this.forFile(key);
+    const knownBefore = new Set(this.store.state.seen[key] ?? []);
+    const freshBefore = comments.filter(c => !knownBefore.has(c.id));
+    let index: ReturnType<typeof indexNodes> | undefined;
+    let fileName = this.fileNames.get(key);
+    if (current.some(s => s.arguments.scope.kind === 'page' || s.arguments.scope.kind === 'frame') &&
+        freshBefore.some(c => current.some(s => Date.parse(c.created_at) >= Date.parse(s.createdAt)))) {
+      const file = await this.figma.file(key); index = indexNodes(file.document); fileName = file.name;
     }
-    this.prune(); await this.store.save();
-    if (failure) { this.emit('pollError', failure); throw failure; }
+    await this.serialized(async () => {
+      if (this.stopped) return;
+      const interested = this.forFile(key);
+      if (!interested.length) return;
+      this.denied.delete(key);
+      const known = new Set(this.store.state.seen[key] ?? []);
+      const fresh = [...new Map(comments.filter(c => !known.has(c.id)).map(c => [c.id, c])).values()]
+        .sort((a,b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
+      if (new Set([...known, ...fresh.map(c => c.id)]).size > 100000) throw new Error(
+        'Observed comment limit (100000 per file) reached; use a new state directory');
+      const byId = new Map(comments.map(c => [c.id, c]));
+      for (const sub of interested) {
+        const discovery = this.discoveries.get(this.scopeKey(sub.arguments.scope));
+        sub.coverage.warnings = [...(discovery?.warnings ?? [])];
+        sub.coverage.complete = sub.coverage.warnings.length === 0;
+        sub.coverage.excluded_unanchored_comments = 0;
+        delete sub.coverage.last_error;
+      }
+      for (const comment of fresh) {
+        let root: Comment = comment;
+        const visited = new Set([root.id]);
+        while (root.parent_id && byId.has(root.parent_id) && !visited.has(root.parent_id)) {
+          root = byId.get(root.parent_id)!; visited.add(root.id);
+        }
+        const nodeId = root.client_meta?.node_id ?? null;
+        const anchor = nodeId ? index?.get(nodeId) : undefined;
+        if (!nodeId || !anchor) for (const sub of interested) {
+          if (Date.parse(comment.created_at) >= Date.parse(sub.createdAt) &&
+              (sub.arguments.scope.kind === 'page' || sub.arguments.scope.kind === 'frame')) {
+            sub.coverage.excluded_unanchored_comments++; sub.coverage.complete = false;
+          }
+        }
+        if (interested.some(s => Date.parse(comment.created_at) >= Date.parse(s.createdAt))) {
+          const sequence = ++this.store.state.sequence;
+          this.store.state.events.push({
+            eventId: `figma_${createHash('sha256').update(`${key}:${comment.id}`).digest('hex')}`,
+            name: eventName, timestamp: comment.created_at, sequence, observedAt: new Date().toISOString(),
+            data: { file_key: key, ...(fileName ? { file_name: fileName } : {}),
+              comment_id: comment.id, thread_id: root.id, parent_id: comment.parent_id || null,
+              text: comment.message, author: { id: comment.user.id,
+                ...(typeof comment.user.handle === 'string' ? { handle: comment.user.handle } : {}) }, created_at: comment.created_at,
+              resolved_at: comment.resolved_at || null, node_id: nodeId, page_id: anchor?.pageId ?? null,
+              ancestor_ids: anchor?.ancestors ?? [], thread_has_tag: tagsIn(root.message),
+              url: `https://www.figma.com/design/${encodeURIComponent(key)}?${new URLSearchParams({
+                ...(nodeId ? { 'node-id': nodeId } : {}), 'comment-id': comment.id }).toString()}` },
+          });
+        }
+        known.add(comment.id);
+      }
+      this.store.state.seen[key] = [...known];
+      for (const sub of interested) {
+        sub.coverage.last_success_at = new Date().toISOString();
+        if (sub.coverage.excluded_unanchored_comments) sub.coverage.warnings.push(
+          'Some comments could not be mapped to a page/frame and were excluded from that scoped subscription.');
+      }
+      this.prune(); await this.store.save(); this.emit('events');
+    });
   }
   start(): void {
-    const run = async () => {
-      try { await this.tick(); this.failures = 0; }
-      catch { this.failures++; }
-      if (!this.stopped) this.timer = setTimeout(run, Math.min(900000, this.interval * 2 ** Math.min(this.failures, 4)));
+    if (this.started || this.stopped) return;
+    this.started = true;
+    const run = () => {
+      if (this.stopped) return;
+      void this.pulse().catch(error => this.emit('pollError', error));
+      this.timer = setTimeout(run, this.interval);
     };
     this.timer = setTimeout(run, 0);
   }
@@ -245,7 +344,9 @@ export class ListenEngine extends EventEmitter {
     if (this.closing) return this.closing;
     this.stopped = true; if (this.timer) clearTimeout(this.timer);
     this.closing = (async () => {
+      await this.queue.close();
       await this.tail.catch(() => {});
+      this.prune();
       try { await this.store.save(); } finally { await this.store.close(); }
     })();
     return this.closing;

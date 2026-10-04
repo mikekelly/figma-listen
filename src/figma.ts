@@ -1,4 +1,5 @@
 import type { Comment, FileNode, FileReference, SubscriptionArguments } from './schema.js';
+import { ResourceQueue } from './queue.js';
 
 export class FigmaError extends Error {
   constructor(message: string, public readonly status: number, public readonly retryAfterMs = 0) {
@@ -6,35 +7,33 @@ export class FigmaError extends Error {
   }
 }
 export interface FigmaSource {
+  readonly requestIntervalMs?: number;
+  requestStatus?(): ReturnType<ResourceQueue['status']>;
   me(): Promise<{ id: string; handle?: string }>;
   comments(key: string): Promise<Comment[]>;
   file(key: string): Promise<{ name: string; document: FileNode }>;
   discover(scope: SubscriptionArguments['scope']): Promise<{ files: FileReference[]; warnings: string[] }>;
 }
 
-/** All calls are serialized and paced. 429 backoff applies to the entire client. */
+/** Request starts are paced; slow responses do not serialize other requests. */
 export class FigmaClient implements FigmaSource {
-  private tail: Promise<unknown> = Promise.resolve();
-  private nextRequestAt = 0;
+  private requests: ResourceQueue;
   private controller = new AbortController();
   constructor(private readonly token: string, private readonly options: {
-    baseUrl?: string; fetch?: typeof fetch; requestIntervalMs?: number; timeoutMs?: number;
-  } = {}) {}
-  close(): void { this.controller.abort(); }
+    baseUrl?: string; fetch?: typeof fetch; requestIntervalMs?: number; timeoutMs?: number; maxConcurrentRequests?: number;
+  } = {}) {
+    this.requests = new ResourceQueue({ startIntervalMs: this.requestIntervalMs,
+      maxConcurrent: options.maxConcurrentRequests ?? 4 });
+  }
+  get requestIntervalMs(): number { return this.options.requestIntervalMs ?? 2000; }
+  requestStatus(): ReturnType<ResourceQueue['status']> { return this.requests.status(); }
+  close(): void { this.controller.abort(); void this.requests.close(); }
   async get<T>(path: string): Promise<T> {
-    const operation = this.tail.then(async () => {
+    const base = this.options.baseUrl ?? 'https://api.figma.com';
+    const url = new URL(path, base);
+    if (url.origin !== new URL(base).origin) throw new Error('Refusing a cross-origin API URL');
+    return this.requests.enqueue(url.href, async () => {
       if (this.controller.signal.aborted) throw new Error('Figma client closed');
-      const delay = this.nextRequestAt - Date.now();
-      if (delay > 0) await new Promise<void>((resolve, reject) => {
-        const signal = this.controller.signal;
-        const abort = () => { clearTimeout(timer); reject(new Error('Figma client closed')); };
-        const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, delay);
-        signal.addEventListener('abort', abort, { once: true });
-      });
-      const base = this.options.baseUrl ?? 'https://api.figma.com';
-      const url = new URL(path, base);
-      if (url.origin !== new URL(base).origin) throw new Error('Refusing a cross-origin API URL');
-      this.nextRequestAt = Date.now() + (this.options.requestIntervalMs ?? 2000);
       const response = await (this.options.fetch ?? fetch)(url, {
         headers: { 'X-Figma-Token': this.token, Accept: 'application/json' },
         redirect: 'error',
@@ -44,7 +43,7 @@ export class FigmaClient implements FigmaSource {
         const raw = response.headers.get('retry-after');
         const retry = raw ? (Number.isFinite(Number(raw)) ? Number(raw) * 1000 : Date.parse(raw) - Date.now()) : 60000;
         const backoff = response.status === 429 ? Math.max(1000, Number.isFinite(retry) ? retry : 60000) : 0;
-        if (backoff) this.nextRequestAt = Date.now() + backoff;
+        if (backoff) this.requests.pause(backoff);
         const hint = response.status === 401 || response.status === 403
           ? 'Token invalid/expired, missing scope, or resource access denied.'
           : response.status === 429 ? 'Rate limited; respecting Retry-After.'
@@ -54,8 +53,6 @@ export class FigmaClient implements FigmaSource {
       }
       return await response.json() as T;
     });
-    this.tail = operation.catch(() => {});
-    return operation;
   }
   me(): Promise<{ id: string; handle?: string }> { return this.get('/v1/me'); }
   async comments(key: string): Promise<Comment[]> {

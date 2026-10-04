@@ -11,8 +11,8 @@ A local, headless MCP companion to the standard Figma MCP. Subscribe to comments
 Requires Node.js **20.19 or newer** and npm. The GitHub release is runnable now; this package has not yet been published to the npm registry.
 
 ```sh
-npx -y github:mikekelly/figma-listen#v1.0.1 --help
-npx -y github:mikekelly/figma-listen#v1.0.1 doctor
+npx -y github:mikekelly/figma-listen#v1.1.0 --help
+npx -y github:mikekelly/figma-listen#v1.1.0 doctor
 ```
 
 With no subcommand, `figma-listen` starts the MCP server. Help, version, and doctor output go to stdout; while serving MCP, stdout contains only protocol messages and diagnostics go to stderr.
@@ -27,7 +27,7 @@ node dist/cli.js doctor
 node dist/cli.js
 ```
 
-`npm ci` builds the TypeScript source. The [v1.0.1 release](https://github.com/mikekelly/figma-listen/releases/tag/v1.0.1) also includes a compiled npm tarball.
+`npm ci` builds the TypeScript source. The [v1.1.0 release](https://github.com/mikekelly/figma-listen/releases/tag/v1.1.0) also includes a compiled npm tarball.
 
 ## Authentication
 
@@ -45,7 +45,7 @@ A token with all available read scopes works. No write scopes are needed. Access
 Choose either:
 
 1. **Environment:** export `FIGMA_ACCESS_TOKEN` in your usual credentials setup. Figma listen uses it without copying it into its config or state files. Run `doctor` from a shell that already has this variable.
-2. **Saved credential:** run `npx -y github:mikekelly/figma-listen#v1.0.1 auth`. Paste the token into the hidden terminal prompt. It is validated, then saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. Linux requires an available Secret Service; environment auth also works without the optional keyring dependency.
+2. **Saved credential:** run `npx -y github:mikekelly/figma-listen#v1.1.0 auth`. Paste the token into the hidden terminal prompt. It is validated, then saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. Linux requires an available Secret Service; environment auth also works without the optional keyring dependency.
 
 The environment variable takes precedence over the saved credential. `logout` removes the saved credential and leaves environment configuration alone. When your token expires, replace the environment value or run `auth` again.
 
@@ -56,7 +56,7 @@ Add this MCP server to your Codex config:
 ```toml
 [mcp_servers.figma_listen]
 command = "npx"
-args = ["-y", "github:mikekelly/figma-listen#v1.0.1"]
+args = ["-y", "github:mikekelly/figma-listen#v1.1.0"]
 env_vars = ["FIGMA_ACCESS_TOKEN"]
 startup_timeout_sec = 120
 ```
@@ -68,7 +68,7 @@ For the checkout at `~/code/figma-listen`, you can instead use an absolute path 
 Use a separate state directory for each simultaneously connected host or Codex session:
 
 ```toml
-args = ["-y", "github:mikekelly/figma-listen#v1.0.1", "--state-dir", "/absolute/path/to/session-state"]
+args = ["-y", "github:mikekelly/figma-listen#v1.1.0", "--state-dir", "/absolute/path/to/session-state"]
 ```
 
 Then ask the agent:
@@ -148,8 +148,12 @@ This is a draft extension, not an assertion that every MCP host supports it. See
 
 ## Polling, state, and limits
 
-- Default polling delay: **60 seconds after each cycle**. Requests are serialized with at least **2 seconds** between them. Large scopes take longer than one interval to scan. Folder discovery refreshes every five minutes.
-- `--poll-interval SECS` changes the delay (minimum 10). `--request-interval MS` changes request spacing. Increasing either reduces API usage. Figma quotas depend on plan, seat, and endpoint tier; conservative spacing cannot guarantee a token will never be rate limited. HTTP 429 honors `Retry-After` globally and errors trigger additional cycle backoff.
+- Default desired polling interval: **3 seconds**. The producer keeps ticking independently of responses. It submits FIFO jobs keyed by file or discovery scope; a resource already queued or running is not submitted again. Overlapping subscriptions share file requests and scope discovery.
+- Jobs dispatch concurrently, with at most **4 HTTP requests in flight** and **2 seconds between request starts** by default. A slow response holds its own slot, not the producer timer or all other requests. If all slots are occupied, additional jobs remain queued. Under saturation, effective per-resource polling slows rather than accumulating duplicate work. The two-second safeguard is our configurable limit, not a universal Figma rule.
+- HTTP **429** pauses the shared HTTP dispatch queue for `Retry-After`; already sent requests may finish, and pending jobs keep their FIFO order. Individual failed file/discovery jobs also retry with exponential backoff, capped at 15 minutes, and reset after a successful attempt. Healthy resources keep running unless a global rate-limit pause applies. Folder discovery refreshes on a five-minute target.
+- `--poll-interval SECS` changes the desired interval (minimum **1 second**). `--request-interval MS` changes global request-start spacing. For example, `--poll-interval 3 --request-interval 1000` targets three seconds while allowing up to one request start per second; use a rate appropriate to your Figma allowance. The desired interval does not override request pacing, concurrency limits, or backoff.
+- Figma publishes PAT limits, but the budget is shared **per user and resource plan**, not independently per token. Comments are Tier 2; limits depend on the seat type and the plan containing the file. Other tools or server processes using that account can consume the same budget. See [Figma rate limits](https://developers.figma.com/docs/rest-api/rate-limits/).
+- `listen_status` exposes the desired interval, resource queue depth, active resources, coalesced job count, and the upstream dispatch queue's concurrency and backoff deadline. Coverage reports the most recent successful poll for each subscription.
 - State defaults to `$XDG_STATE_HOME/figma-listen` or `~/.local/state/figma-listen`. Override with `FIGMA_LISTEN_STATE_DIR` or `--state-dir`. One process owns each state directory. State is tied to the authenticated Figma account.
 - The state contains comment text, subscriptions, seen IDs, and cursors; **never the token**. State files use mode `0600`, newly created state directories `0700`, and writes use atomic rename.
 - The event buffer retains up to **7 days / 10,000 events**, whichever limit comes first. Cursors crossing a retention boundary report `truncated: true`; consumers should report the gap rather than assume complete delivery. Observed IDs survive event eviction so retained comments do not reappear as new events.
@@ -171,7 +175,7 @@ npm pack
 node scripts/smoke-live.mjs
 ```
 
-Automated tests cover filtering, shared polling, discovery, authentication error redaction, rate limits, persistence, retention, both MCP handshake generations, push notifications, replay, and cancellation. CI checks Node 20, 22, and 24. Live authentication was checked before release; live comment activity and Codex wakeups were not tested.
+Automated tests cover filtering, shared polling/discovery, nonblocking FIFO dispatch, bounded concurrency, duplicate coalescing, independent scheduling during slow requests, responsive subscription tools, rate-limit and exponential backoff, authentication error redaction, persistence, retention, both MCP handshake generations, push notifications, replay, and cancellation. CI checks Node 20, 22, and 24. Live authentication was checked before release; live comment activity and Codex wakeups were not tested.
 
 API references: [comments](https://developers.figma.com/docs/rest-api/comments-endpoints/), [folders](https://developers.figma.com/docs/rest-api/folders-endpoints/), [scopes](https://developers.figma.com/docs/rest-api/scopes/), [rate limits](https://developers.figma.com/docs/rest-api/rate-limits/).
 
