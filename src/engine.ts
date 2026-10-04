@@ -172,7 +172,8 @@ export class ListenEngine extends EventEmitter {
         const comments = await this.figma.comments(key);
         this.denied.delete(key);
         const known = new Set(this.store.state.seen[key] ?? []);
-        const fresh = comments.filter(c => !known.has(c.id)).sort((a,b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
+        const fresh = [...new Map(comments.filter(c => !known.has(c.id)).map(c => [c.id, c])).values()]
+          .sort((a,b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
         if (new Set([...known, ...fresh.map(c => c.id)]).size > 100000) throw new Error(
           'Observed comment limit (100000 per file) reached; use a new state directory');
         const byId = new Map(comments.map(c => [c.id, c]));
@@ -204,7 +205,8 @@ export class ListenEngine extends EventEmitter {
               name: eventName, timestamp: comment.created_at, sequence, observedAt: new Date().toISOString(),
               data: { file_key: key, ...(names.has(key) ? { file_name: names.get(key) } : {}),
                 comment_id: comment.id, thread_id: root.id, parent_id: comment.parent_id || null,
-                text: comment.message, author: comment.user, created_at: comment.created_at,
+                text: comment.message, author: { id: comment.user.id,
+                  ...(typeof comment.user.handle === 'string' ? { handle: comment.user.handle } : {}) }, created_at: comment.created_at,
                 resolved_at: comment.resolved_at || null, node_id: nodeId, page_id: anchor?.pageId ?? null,
                 ancestor_ids: anchor?.ancestors ?? [], thread_has_tag: tagsIn(root.message),
                 url: `https://www.figma.com/design/${encodeURIComponent(key)}?${new URLSearchParams({

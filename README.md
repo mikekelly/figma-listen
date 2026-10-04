@@ -11,8 +11,8 @@ A local, headless MCP companion to the standard Figma MCP. Subscribe to comments
 Requires Node.js **20.19 or newer** and npm. The GitHub release is runnable now; this package has not yet been published to the npm registry.
 
 ```sh
-npx -y github:mikekelly/figma-listen#v1.0.0 --help
-npx -y github:mikekelly/figma-listen#v1.0.0 doctor
+npx -y github:mikekelly/figma-listen#v1.0.1 --help
+npx -y github:mikekelly/figma-listen#v1.0.1 doctor
 ```
 
 With no subcommand, `figma-listen` starts the MCP server. Help, version, and doctor output go to stdout; while serving MCP, stdout contains only protocol messages and diagnostics go to stderr.
@@ -27,7 +27,7 @@ node dist/cli.js doctor
 node dist/cli.js
 ```
 
-`npm ci` builds the TypeScript source. The [v1.0.0 release](https://github.com/mikekelly/figma-listen/releases/tag/v1.0.0) also includes a compiled npm tarball.
+`npm ci` builds the TypeScript source. The [v1.0.1 release](https://github.com/mikekelly/figma-listen/releases/tag/v1.0.1) also includes a compiled npm tarball.
 
 ## Authentication
 
@@ -45,7 +45,7 @@ A token with all available read scopes works. No write scopes are needed. Access
 Choose either:
 
 1. **Environment:** export `FIGMA_ACCESS_TOKEN` in your usual credentials setup. Figma listen uses it without copying it into its config or state files. Run `doctor` from a shell that already has this variable.
-2. **Saved credential:** run `npx -y github:mikekelly/figma-listen#v1.0.0 auth`. Paste the token into the hidden terminal prompt. It is validated, then saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. Linux requires an available Secret Service; environment auth also works without the optional keyring dependency.
+2. **Saved credential:** run `npx -y github:mikekelly/figma-listen#v1.0.1 auth`. Paste the token into the hidden terminal prompt. It is validated, then saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. Linux requires an available Secret Service; environment auth also works without the optional keyring dependency.
 
 The environment variable takes precedence over the saved credential. `logout` removes the saved credential and leaves environment configuration alone. When your token expires, replace the environment value or run `auth` again.
 
@@ -56,7 +56,7 @@ Add this MCP server to your Codex config:
 ```toml
 [mcp_servers.figma_listen]
 command = "npx"
-args = ["-y", "github:mikekelly/figma-listen#v1.0.0"]
+args = ["-y", "github:mikekelly/figma-listen#v1.0.1"]
 env_vars = ["FIGMA_ACCESS_TOKEN"]
 startup_timeout_sec = 120
 ```
@@ -68,7 +68,7 @@ For the checkout at `~/code/figma-listen`, you can instead use an absolute path 
 Use a separate state directory for each simultaneously connected host or Codex session:
 
 ```toml
-args = ["-y", "github:mikekelly/figma-listen#v1.0.0", "--state-dir", "/absolute/path/to/session-state"]
+args = ["-y", "github:mikekelly/figma-listen#v1.0.1", "--state-dir", "/absolute/path/to/session-state"]
 ```
 
 Then ask the agent:

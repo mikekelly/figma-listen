@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { StateStore } from '../dist/store.js';
 import { ListenEngine } from '../dist/engine.js';
 import { FigmaError } from '../dist/figma.js';
-import { tagsIn } from '../dist/schema.js';
+import { tagsIn, eventPayloadSchema } from '../dist/schema.js';
 import { fixture, comment, fileScope } from './helpers.mjs';
 
 test('baselines history, deduplicates shared polling, and delivers exact #bot matches and thread replies', async t => {
@@ -99,4 +99,15 @@ test('folder discovery refreshes dynamically and canonical subscriptions are ide
   figma.discovered.push({ key: 'fileB' }); figma.snapshots.set('fileB', [comment('b', 'New file')]);
   await engine.tick();
   assert.equal(engine.read(sub.id).events[0].data.file_key, 'fileB');
+});
+
+test('projects REST user metadata to the advertised payload and deduplicates IDs within snapshots', async t => {
+  const { engine, figma } = await fixture(t);
+  const sub = await engine.subscribe(fileScope);
+  const item = comment('one', 'Hello', { user: { id: 'user', handle: 'Designer', img_url: 'https://example.com/avatar' } });
+  figma.snapshots.set('fileA', [item, item]); await engine.tick();
+  const events = engine.read(sub.id).events;
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].data.author, { id: 'user', handle: 'Designer' });
+  assert.deepEqual(eventPayloadSchema.parse(events[0].data), events[0].data);
 });

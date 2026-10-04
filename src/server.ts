@@ -3,7 +3,7 @@ import * as z from 'zod/v4';
 import { ListenEngine } from './engine.js';
 import { eventName, eventPayloadSchema, subscriptionSchema } from './schema.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.0.1';
 const catalog = () => ({ events: [{ name: eventName,
   description: 'A new Figma comment or reply, observed by REST polling. Filter by scope and optionally a hashtag.',
   delivery: ['push', 'poll'], inputSchema: z.toJSONSchema(subscriptionSchema, { io: 'input' }),
