@@ -238,3 +238,28 @@ test('v1.1 state migration preserves old comment-only subscriptions and baseline
   assert.deepEqual(resumed.subscription(sub.id).arguments.event_types, ['figma.comment.created']);
   await resumed.tick(); await resumed.close();
 });
+
+test('live-style stale metadata cannot hide a newer document version', async t => {
+  const { FigmaClient } = await import('../dist/figma.js');
+  const advance = timing(t);
+  const { engine, figma } = await fixture(t);
+  const file = await figma.file();
+  const paths = [];
+  const client = new FigmaClient('test', { requestIntervalMs: 0, fetch: async url => {
+    paths.push(url.pathname + url.search);
+    const response = url.pathname.endsWith('/meta') ? { file: { name: file.name, version: '1' } } : file;
+    return new Response(JSON.stringify(response));
+  } });
+  t.after(() => client.close());
+  figma.metadata = key => client.metadata(key);
+  figma.file = key => client.file(key);
+  const sub = await engine.subscribe({ ...fileScope, event_types: ['figma.design.changed'] });
+  await engine.tick();
+  advance(); file.version = '2'; file.document.children[0].children[0].name = 'Renamed';
+  await engine.tick();
+  const events = engine.read(sub.id).events;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.version, '2');
+  assert.deepEqual(events[0].data.changes.find(c => c.node_id === '2:1').changed_properties, ['name']);
+  assert.equal(paths.some(path => path.endsWith('/meta')), false);
+});

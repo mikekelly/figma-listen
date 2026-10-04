@@ -76,10 +76,12 @@ export class FigmaClient implements FigmaSource {
     return file;
   }
   async metadata(key: string): Promise<{ name: string; version: string }> {
-    const result = await this.get<{ file: { name: string; version: string } }>(`/v1/files/${encodeURIComponent(key)}/meta`);
-    if (typeof result.file?.version !== 'string' || typeof result.file?.name !== 'string')
+    // /meta can lag behind edits already visible in GET file. Read the version
+    // from the document endpoint, with a shallow tree to keep the payload small.
+    const result = await this.get<{ name: string; version: string }>(`/v1/files/${encodeURIComponent(key)}?depth=1`);
+    if (typeof result.version !== 'string' || typeof result.name !== 'string')
       throw new Error('Figma returned invalid file metadata');
-    return { name: result.file.name, version: result.file.version };
+    return { name: result.name, version: result.version };
   }
   async reactions(key: string, commentId: string): Promise<Reaction[]> {
     const result: Reaction[] = [];

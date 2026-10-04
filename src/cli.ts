@@ -60,7 +60,7 @@ async function main(): Promise<void> {
         state_directory: directory, poll_interval_ms: interval, request_interval_ms: spacing,
         polling_scheduler: 'FIFO; one pending or running job per resource',
         required_scopes: ['current_user:read','file_comments:read'],
-        optional_scopes: ['file_content:read','file_metadata:read','folders:read'],
+        optional_scopes: ['file_content:read','folders:read'],
         push_compatibility: 'Requires a host implementing the draft MCP Events extension; not verified for Codex.' }, null, 2) + '\n');
       figma.close(); return;
     }

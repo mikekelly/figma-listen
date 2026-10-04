@@ -52,7 +52,7 @@ test('recursive v2 discovery deduplicates files and reports partial organization
   client.close();
 });
 
-test('design reads use metadata and vector geometry; malformed snapshots fail before diffing', async () => {
+test('design reads use shallow document versions and vector geometry; malformed snapshots fail before diffing', async () => {
   const paths = [];
   const client = new FigmaClient('fake', { requestIntervalMs: 0, fetch: async url => {
     paths.push(url.pathname + url.search);
@@ -61,7 +61,7 @@ test('design reads use metadata and vector geometry; malformed snapshots fail be
   } });
   assert.deepEqual(await client.metadata('fileA'), { name: 'Design', version: 'v2' });
   assert.equal((await client.file('fileA')).document.id, '0:0');
-  assert.deepEqual(paths, ['/v1/files/fileA/meta', '/v1/files/fileA?geometry=paths']);
+  assert.deepEqual(paths, ['/v1/files/fileA?depth=1', '/v1/files/fileA?geometry=paths']);
   client.close();
   const invalid = new FigmaClient('fake', { requestIntervalMs: 0, fetch: async () => new Response('{}') });
   await assert.rejects(invalid.metadata('fileA'), /invalid file metadata/);

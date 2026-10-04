@@ -3,7 +3,7 @@ import * as z from 'zod/v4';
 import { ListenEngine } from './engine.js';
 import { eventNames, commentPayloadSchema, designPayloadSchema, isDesignEvent, subscriptionSchema } from './schema.js';
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.2.1';
 const catalog = () => ({ events: eventNames.map(name => ({ name,
   description: `${name}: observed by REST snapshot polling. Filter by file, page, section or frame; tags apply to comments/reactions.`,
   delivery: ['push', 'poll'], inputSchema: z.toJSONSchema(subscriptionSchema, { io: 'input' }),
