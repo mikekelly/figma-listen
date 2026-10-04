@@ -19,7 +19,7 @@ In Figma, go to **Settings > Security > Personal access tokens > Generate new to
 Save your token by running this in your terminal, then paste it into the hidden prompt:
 
 ```sh
-npx -y github:mikekelly/figma-listen#v1.1.0 auth
+npx -y @mikekelly/figma-listen auth
 ```
 
 If you already export `FIGMA_ACCESS_TOKEN`, you can use that instead of saving a token with `auth`.
@@ -35,7 +35,7 @@ Ask your agent:
 ```toml
 [mcp_servers.figma_listen]
 command = "npx"
-args = ["-y", "github:mikekelly/figma-listen#v1.1.0"]
+args = ["-y", "@mikekelly/figma-listen"]
 env_vars = ["FIGMA_ACCESS_TOKEN"]
 startup_timeout_sec = 120
 ```
@@ -43,7 +43,7 @@ startup_timeout_sec = 120
 Check that authentication is working:
 
 ```sh
-npx -y github:mikekelly/figma-listen#v1.1.0 doctor
+npx -y @mikekelly/figma-listen doctor
 ```
 
 Once connected, ask your agent to subscribe to the files you're reviewing. For example:
@@ -79,10 +79,17 @@ Access is limited to resources visible to the token's account. The official Figm
 
 ## Other ways to run
 
-The GitHub release is runnable through `npx`; the package has not yet been published to the npm registry.
+Run the npm package directly with `npx`:
 
 ```sh
-npx -y github:mikekelly/figma-listen#v1.1.0 --help
+npx -y @mikekelly/figma-listen --help
+```
+
+Or install it globally:
+
+```sh
+npm install -g @mikekelly/figma-listen
+figma-listen --help
 ```
 
 With no subcommand, `figma-listen` starts the MCP server. Help, version, and doctor output go to stdout; while serving MCP, stdout contains only protocol messages and diagnostics go to stderr.
@@ -97,7 +104,7 @@ node dist/cli.js doctor
 node dist/cli.js
 ```
 
-`npm ci` builds the TypeScript source. The [v1.1.0 release](https://github.com/mikekelly/figma-listen/releases/tag/v1.1.0) also includes a compiled npm tarball.
+`npm ci` builds the TypeScript source. Compiled tarballs are also available from [GitHub releases](https://github.com/mikekelly/figma-listen/releases).
 
 ## Advanced Codex configuration
 
@@ -108,7 +115,7 @@ For the checkout at `~/code/figma-listen`, you can instead use an absolute path 
 Use a separate state directory for each simultaneously connected host or Codex session:
 
 ```toml
-args = ["-y", "github:mikekelly/figma-listen#v1.1.0", "--state-dir", "/absolute/path/to/session-state"]
+args = ["-y", "@mikekelly/figma-listen", "--state-dir", "/absolute/path/to/session-state"]
 ```
 
 ## Subscriptions
