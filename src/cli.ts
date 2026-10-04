@@ -22,6 +22,7 @@ Options:
   --state-dir PATH      Persistent state directory (one process per directory)
   --poll-interval SECS  Desired resource polling interval; default 3, minimum 1
   --request-interval MS Minimum spacing between Figma requests; default 2000
+  --design-quiet SECS   Flush design changes after this quiet period; default 120
   --help                Show this help
   --version             Print version
 
@@ -32,7 +33,7 @@ Push requires an MCP Events capable host. Retrieval tools work on ordinary MCP c
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({ allowPositionals: true, options: {
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean' },
-    'state-dir': { type: 'string' }, 'poll-interval': { type: 'string' }, 'request-interval': { type: 'string' },
+    'design-quiet': { type: 'string' }, 'state-dir': { type: 'string' }, 'poll-interval': { type: 'string' }, 'request-interval': { type: 'string' },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   if (values.version) { process.stdout.write(`${VERSION}\n`); return; }
@@ -43,6 +44,8 @@ async function main(): Promise<void> {
     process.stderr.write('Saved token removed. FIGMA_ACCESS_TOKEN, if set, still takes precedence.\n'); return;
   }
   const interval = Number(values['poll-interval'] ?? 3) * 1000;
+  const quiet = Number(values['design-quiet'] ?? 120) * 1000;
+  if (!Number.isFinite(quiet) || quiet < 0 || quiet > 86400000) throw new Error('--design-quiet must be between 0 and 86400 seconds');
   const spacing = Number(values['request-interval'] ?? 2000);
   if (!Number.isFinite(interval) || interval < 1000 || interval > 86400000) throw new Error('--poll-interval must be between 1 and 86400 seconds');
   if (!Number.isFinite(spacing) || spacing < 0 || spacing > 60000) throw new Error('--request-interval must be between 0 and 60000 milliseconds');
@@ -57,7 +60,7 @@ async function main(): Promise<void> {
     if (positionals[0] === 'doctor') {
       process.stdout.write(JSON.stringify({ version: VERSION, authenticated: true, user_id: user.id,
         token_source: process.env.FIGMA_ACCESS_TOKEN?.trim() ? 'environment' : 'credential_store',
-        state_directory: directory, poll_interval_ms: interval, request_interval_ms: spacing,
+        state_directory: directory, poll_interval_ms: interval, design_quiet_period_ms: quiet, request_interval_ms: spacing,
         polling_scheduler: 'FIFO; one pending or running job per resource',
         required_scopes: ['current_user:read','file_comments:read'],
         optional_scopes: ['file_content:read','folders:read'],
@@ -65,7 +68,7 @@ async function main(): Promise<void> {
       figma.close(); return;
     }
     const store = new StateStore(directory); await store.open(user.id);
-    engine = new ListenEngine(store, figma, { pollIntervalMs: interval });
+    engine = new ListenEngine(store, figma, { pollIntervalMs: interval, designQuietPeriodMs: quiet });
     engine.on('pollError', (error: Error) => process.stderr.write(`figma-listen: ${error.message}\n`));
     let closing = false;
     const handle = serveStdio(() => createServer(engine!));

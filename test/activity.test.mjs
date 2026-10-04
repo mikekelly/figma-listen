@@ -13,8 +13,8 @@ function timing(t) {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   return () => t.mock.timers.tick(1000);
 }
-async function designFixture(t) {
-  const data = await fixture(t);
+async function designFixture(t, options = { designQuietPeriodMs: 0 }) {
+  const data = await fixture(t, options);
   let document = { name: 'Design', version: '1', document: { id: '0:0', type: 'DOCUMENT', children: [
     { id: '1:1', type: 'CANVAS', name: 'Checkout', children: [
       { id: '2:1', type: 'SECTION', name: 'Payment', children: [
@@ -98,14 +98,14 @@ test('fallback reaction requests recover from failures without blocking comment 
   assert.equal(engine.subscription(sub.id).coverage.last_error, undefined);
 });
 
-test('design diffs cover text, color, added/removed nodes and scope membership moves, sharing version polls', async t => {
+test('design diffs cover text, color, added/removed nodes and scope membership moves, sharing document polls', async t => {
   const advance = timing(t);
   const { engine, edit, counts, figma } = await designFixture(t);
   const all = await engine.subscribe({ ...fileScope, event_types: designTypes });
   const scoped = await engine.subscribe({ ...section, event_types: designTypes, tag: '#bot' });
   const other = await engine.subscribe({ scope: { kind: 'section', file_key: 'fileA', node_id: '2:2' }, event_types: designTypes });
   await engine.tick(); await engine.tick();
-  assert.deepEqual(counts(), { fetches: 1, metadataCalls: 2 });
+  assert.deepEqual(counts(), { fetches: 2, metadataCalls: 0 });
   assert.equal(figma.calls.length, 0, 'design-only subscriptions never poll comments');
   advance(); edit(d => {
     const frame = d.document.children[0].children[0].children[0];
@@ -151,7 +151,7 @@ test('persisted snapshots detect changes after restart without repeating events 
   advance(); edit(d => { d.document.children[0].name = 'Changed offline'; });
   figma.snapshots.set('fileA', [old('root', 'Edited offline')]);
   const store = new StateStore(directory); await store.open('user');
-  const resumed = new ListenEngine(store, figma); t.after(() => resumed.close());
+  const resumed = new ListenEngine(store, figma, { designQuietPeriodMs: 0 }); t.after(() => resumed.close());
   await resumed.tick();
   const batch = resumed.read(sub.id, cursor);
   assert.deepEqual(names(batch).sort(), ['figma.comment.edited', 'figma.design.changed']);
@@ -230,19 +230,20 @@ test('v1.1 state migration preserves old comment-only subscriptions and baseline
   const { engine, directory, store, figma } = await fixture(t);
   const sub = await engine.subscribe({ ...fileScope, event_types: ['figma.comment.created'] }); await engine.close();
   const legacy = structuredClone(store.state);
-  delete legacy.comments; delete legacy.designs; delete legacy.reactions;
+  delete legacy.comments; delete legacy.designs; delete legacy.reactions; delete legacy.pendingDesigns;
   delete legacy.subscriptions[0].arguments.event_types;
   await writeFile(join(directory, 'state.json'), JSON.stringify(legacy));
   const migrated = new StateStore(directory); await migrated.open('user');
   const resumed = new ListenEngine(migrated, figma);
   assert.deepEqual(resumed.subscription(sub.id).arguments.event_types, ['figma.comment.created']);
+  assert.deepEqual(migrated.state.pendingDesigns, {});
   await resumed.tick(); await resumed.close();
 });
 
 test('live-style stale metadata cannot hide a newer document version', async t => {
   const { FigmaClient } = await import('../dist/figma.js');
   const advance = timing(t);
-  const { engine, figma } = await fixture(t);
+  const { engine, figma } = await fixture(t, { designQuietPeriodMs: 0 });
   const file = await figma.file();
   const paths = [];
   const client = new FigmaClient('test', { requestIntervalMs: 0, fetch: async url => {
@@ -262,4 +263,160 @@ test('live-style stale metadata cannot hide a newer document version', async t =
   assert.equal(events[0].data.version, '2');
   assert.deepEqual(events[0].data.changes.find(c => c.node_id === '2:1').changed_properties, ['name']);
   assert.equal(paths.some(path => path.endsWith('/meta')), false);
+});
+
+test('default 120-second quiet window batches mutable-version edits; other scopes and comments do not reset it', async t => {
+  timing(t);
+  const { engine, doc, figma } = await designFixture(t, {});
+  const sub = await engine.subscribe({ ...section, event_types: ['figma.design.changed', 'figma.comment.created'] });
+  const all = await engine.subscribe({ ...fileScope, event_types: ['figma.design.changed'] });
+  await engine.tick();
+  t.mock.timers.tick(1000);
+  doc().document.children[0].children[0].children[0].children[0].characters = 'First edit';
+  await engine.tick();
+  assert.equal(engine.read(sub.id).events.length, 0);
+  t.mock.timers.tick(60000);
+  doc().document.children[0].children[0].children[0].children[0].characters = 'Final edit';
+  await engine.tick();
+  t.mock.timers.tick(119999);
+  doc().document.children[1].name = 'Unrelated page';
+  figma.snapshots.set('fileA', [comment('new', 'Review', { client_meta: { node_id: '4:1' } })]);
+  await engine.tick();
+  const before = engine.read(sub.id);
+  assert.deepEqual(names(before), ['figma.comment.created']);
+  assert.equal(engine.read(all.id).events.length, 0);
+  t.mock.timers.tick(1);
+  await engine.tick();
+  const batch = engine.read(sub.id, before.cursor);
+  assert.deepEqual(names(batch), ['figma.design.changed']);
+  const data = batch.events[0].data;
+  assert.equal(data.version, data.previous_version, 'same version ID still produces an edit');
+  assert.equal(data.quiet_period_ms, 120000);
+  assert.deepEqual(data.changes.map(c => c.node_id), ['4:1']);
+  assert.deepEqual(data.changes[0].changed_properties, ['characters']);
+  assert.equal('subscriptionId' in batch.events[0], false, 'internal recipient is not exposed');
+  assert.deepEqual(eventPayloadSchema.parse(data), data);
+  assert.equal(engine.read(all.id).events.length, 0, 'file subscription has its own later deadline');
+  t.mock.timers.tick(120000); await engine.tick();
+  assert.equal(engine.read(all.id).events.length, 1);
+  assert.equal(engine.read(sub.id, batch.cursor).events.length, 0, 'overlapping subscriptions do not duplicate delivery');
+});
+
+test('version-only changes and fully reverted edits do not produce changesets', async t => {
+  timing(t);
+  const { engine, doc } = await designFixture(t, {});
+  const sub = await engine.subscribe({ ...fileScope, event_types: designTypes }); await engine.tick();
+  t.mock.timers.tick(1000); doc().version = '2'; await engine.tick();
+  assert.equal(engine.pollingStatus().pending_design_changesets.length, 0);
+  const original = structuredClone(doc().document);
+  doc().document.children[0].children[0].children.push({ id: 'new:1', type: 'RECTANGLE' });
+  doc().document.children[0].children[0].name = 'Temporary'; await engine.tick();
+  t.mock.timers.tick(60000); doc().document = original; await engine.tick();
+  t.mock.timers.tick(120000); await engine.tick();
+  assert.equal(engine.read(sub.id).events.length, 0);
+  assert.equal(engine.pollingStatus().pending_design_changesets.length, 0);
+});
+
+test('pending changesets survive restart and require a successful read before flushing after failures', async t => {
+  timing(t);
+  const { engine, doc, figma, directory, store } = await designFixture(t, {});
+  const sub = await engine.subscribe({ ...section, event_types: designTypes }); await engine.tick();
+  t.mock.timers.tick(1000); doc().document.children[0].children[0].name = 'Changed'; await engine.tick();
+  await engine.close();
+  const reopened = new StateStore(directory); await reopened.open('user');
+  const resumed = new ListenEngine(reopened, figma); t.after(() => resumed.close());
+  assert.equal(resumed.pollingStatus().pending_design_changesets.length, 1);
+  t.mock.timers.tick(120000);
+  const readFile = figma.file;
+  figma.file = async () => { throw new FigmaError('Figma HTTP 503', 503); };
+  await assert.rejects(resumed.tick(), /503/);
+  assert.equal(resumed.read(sub.id).events.length, 0);
+  assert.equal(Object.keys(reopened.state.pendingDesigns).length, 1);
+  figma.file = readFile; t.mock.timers.tick(10000); await resumed.tick();
+  const batch = resumed.read(sub.id);
+  assert.deepEqual(names(batch), ['figma.design.changed']);
+  assert.equal(batch.events[0].data.changes[0].before.name, 'Payment');
+  assert.equal(batch.events[0].data.changes[0].after.name, 'Changed');
+  await resumed.tick(); assert.equal(resumed.read(sub.id, batch.cursor).events.length, 0);
+  assert.equal(store.state.events.length, 0, 'nothing was emitted before restart');
+  await resumed.close();
+});
+
+test('net scope movement and deletion wait for quiet; a restored target cancels transient deletion', async t => {
+  timing(t);
+  const { engine, doc } = await designFixture(t, {});
+  const sub = await engine.subscribe({ ...section, event_types: designTypes }); await engine.tick();
+  t.mock.timers.tick(1000);
+  const [a,b] = doc().document.children[0].children;
+  b.children.push(a.children.pop()); await engine.tick();
+  t.mock.timers.tick(120000); await engine.tick();
+  let batch = engine.read(sub.id);
+  assert.equal(batch.events[0].data.changes.find(c => c.node_id === '3:1').kind, 'left');
+  t.mock.timers.tick(1000);
+  doc().document.children[0].children.shift(); await engine.tick();
+  assert.equal(engine.subscription(sub.id).coverage.target_status, 'missing');
+  assert.equal(engine.read(sub.id, batch.cursor).events.length, 0);
+  t.mock.timers.tick(60000); doc().document.children[0].children.unshift(a); await engine.tick();
+  t.mock.timers.tick(120000); await engine.tick();
+  assert.equal(engine.read(sub.id, batch.cursor).events.length, 0);
+  t.mock.timers.tick(1000); doc().document.children[0].children.shift(); await engine.tick();
+  t.mock.timers.tick(120000); await engine.tick();
+  batch = engine.read(sub.id, batch.cursor);
+  assert.deepEqual(names(batch), ['figma.design.changed', 'figma.scope.deleted']);
+});
+
+test('a new overlapping subscriber baselines independently while an older changeset is pending', async t => {
+  timing(t);
+  const { engine, doc } = await designFixture(t, {});
+  const first = await engine.subscribe({ ...section, event_types: designTypes }); await engine.tick();
+  t.mock.timers.tick(1000); doc().document.children[0].children[0].name = 'Earlier edit'; await engine.tick();
+  t.mock.timers.tick(1000);
+  const second = await engine.subscribe({ ...section, event_types: ['figma.design.changed'], tag: '#bot' });
+  await engine.tick();
+  t.mock.timers.tick(120000); await engine.tick();
+  assert.equal(engine.read(first.id).events.length, 1);
+  assert.equal(engine.read(second.id).events.length, 0);
+  t.mock.timers.tick(1000); doc().document.children[0].children[0].name = 'Later edit'; await engine.tick();
+  await engine.unsubscribe(first.id);
+  assert.equal(engine.pollingStatus().pending_design_changesets.length, 1, 'unsubscription discards its pending batch');
+  t.mock.timers.tick(120000); await engine.tick();
+  const batch = engine.read(second.id);
+  assert.equal(batch.events.length, 1);
+  assert.equal(batch.events[0].data.changes[0].before.name, 'Earlier edit');
+});
+
+test('folder scope waits for quiet across all its files and fresh successful snapshots', async t => {
+  timing(t);
+  const { engine, doc, figma } = await designFixture(t, {});
+  const a = doc(), b = structuredClone(a);
+  figma.discovered.push({ key: 'fileB', name: 'Other file' });
+  let failB = false;
+  figma.file = async key => {
+    if (key === 'fileB' && failB) throw new FigmaError('Figma HTTP 503', 503);
+    return structuredClone(key === 'fileB' ? b : a);
+  };
+  const sub = await engine.subscribe({ scope: { kind: 'folder', folder_id: 'folder' }, event_types: ['figma.design.changed'] });
+  await engine.tick();
+  t.mock.timers.tick(1000); a.document.children[0].name = 'File A edit'; await engine.tick();
+  t.mock.timers.tick(60000); b.document.children[0].name = 'File B edit'; await engine.tick();
+  t.mock.timers.tick(60000); await engine.tick(); assert.equal(engine.read(sub.id).events.length, 0);
+  t.mock.timers.tick(60000); failB = true;
+  await assert.rejects(engine.tick(), /503/); assert.equal(engine.read(sub.id).events.length, 0);
+  failB = false; t.mock.timers.tick(10000); await engine.tick();
+  assert.deepEqual(engine.read(sub.id).events.map(e => e.data.file_key).sort(), ['fileA', 'fileB']);
+});
+
+test('file renames batch without node changes and do not delay scoped design batches', async t => {
+  timing(t);
+  const { engine, doc } = await designFixture(t, {});
+  const all = await engine.subscribe({ ...fileScope, event_types: ['figma.design.changed'] });
+  const scoped = await engine.subscribe({ ...section, event_types: ['figma.design.changed'] }); await engine.tick();
+  t.mock.timers.tick(1000); doc().name = 'Renamed file'; await engine.tick();
+  assert.equal(engine.pollingStatus().pending_design_changesets.length, 1);
+  t.mock.timers.tick(120000); await engine.tick();
+  const data = engine.read(all.id).events[0].data;
+  assert.equal(data.metadata_changed, true);
+  assert.deepEqual(data.changes, []);
+  assert.equal(data.file_name, 'Renamed file');
+  assert.equal(engine.read(scoped.id).events.length, 0);
 });

@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile, rename, unlink, open, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { EventOccurrence, Subscription, CommentSnapshot, DesignSnapshot, Reaction } from './schema.js';
+import type { EventOccurrence, Subscription, CommentSnapshot, DesignSnapshot, PendingDesign, Reaction } from './schema.js';
 
 export interface State {
   version: 1; epoch: string; ownerId: string; sequence: number;
@@ -10,6 +10,7 @@ export interface State {
   events: EventOccurrence[];
   comments: Record<string, CommentSnapshot>;
   designs: Record<string, DesignSnapshot>;
+  pendingDesigns: Record<string, PendingDesign>;
   reactions: Record<string, { observedAt: string; items: Reaction[] }>;
   /** Any cursor below this sequence crossed an eviction boundary. */
   droppedThrough: number;
@@ -43,7 +44,7 @@ export class StateStore {
           !Number.isSafeInteger(raw.droppedThrough)) throw new Error('Unsupported or corrupt state file');
       if (raw.ownerId !== ownerId) throw new Error('Saved state belongs to another Figma account. Use a different --state-dir.');
       // v1.1 state is migrated without replaying historical edits/designs.
-      raw.comments ??= {}; raw.designs ??= {}; raw.reactions ??= {};
+      raw.comments ??= {}; raw.designs ??= {}; raw.reactions ??= {}; raw.pendingDesigns ??= {};
       for (const sub of raw.subscriptions) sub.arguments.event_types ??= ['figma.comment.created'];
       this.state = raw;
       this.state.subscriptions = raw.subscriptions.filter(s => s.source === 'tool' ||
@@ -52,7 +53,7 @@ export class StateStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { await this.close(); throw error; }
       this.state = { version: 1, epoch: randomUUID(), ownerId, sequence: 0,
-        subscriptions: [], seen: {}, events: [], comments: {}, designs: {}, reactions: {}, droppedThrough: 0 };
+        subscriptions: [], seen: {}, events: [], comments: {}, designs: {}, pendingDesigns: {}, reactions: {}, droppedThrough: 0 };
     }
   }
   async save(): Promise<void> {

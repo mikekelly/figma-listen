@@ -54,7 +54,7 @@ See [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=
 
 ## Notification support
 
-Figma listen checks for activity on a **three-second target interval**, subject to request pacing and Figma's rate limits. It sends notifications as soon as polling detects a matching change.
+Figma listen checks for activity on a **three-second target interval**, subject to request pacing and Figma's rate limits. Comments and reactions are delivered as soon as polling detects a matching change. Design edits are collected into a changeset and delivered after **120 seconds without an observed design change in the subscribed scope**.
 
 Automatic notifications require an agent host that implements the experimental MCP Events extension. **Codex automatic push/wakeup support has not been established.** Ordinary MCP clients can use the subscription and retrieval tools during an active agent session; installing this server alone does not make an idle agent respond to comments.
 
@@ -72,7 +72,7 @@ All available read scopes work. If you prefer to select only the scopes used by 
 | --- | --- |
 | `current_user:read` | Authentication check and binding local state to your Figma account |
 | `file_comments:read` | Reading comments and replies |
-| `file_content:read` | Document version checks, design snapshots and mapping comments into page/section/frame scopes |
+| `file_content:read` | Design snapshots and mapping comments into page/section/frame scopes |
 | `folders:read` | Discovering files in folders and teams |
 
 Access is limited to resources visible to the token's account. The official Figma MCP's OAuth credentials are managed separately and are not reused by this server.
@@ -131,7 +131,7 @@ Call `listen_subscribe` with a scope, optional event types and optional comment 
 }
 ```
 
-This watches the section's design changes and tagged comments/replies. Omit `event_types` to receive **all supported event types**. For comments only, explicitly select the `figma.comment.*` names you want (wildcards are not accepted); these subscriptions do not poll design versions. Tags filter **comments and reactions only**, so a tag never suppresses design changes.
+This watches the section's design changes and tagged comments/replies. Omit `event_types` to receive **all supported event types**. For comments only, explicitly select the `figma.comment.*` names you want (wildcards are not accepted); these subscriptions do not poll design snapshots. Tags filter **comments and reactions only**, so a tag never suppresses design changes.
 
 | Scope | Required fields | Coverage |
 | --- | --- | --- |
@@ -149,7 +149,7 @@ For file/page/section/frame scopes you can supply a Figma URL instead of IDs, fo
 { "scope": { "kind": "section", "url": "https://www.figma.com/design/YOUR_FILE_KEY/Design?node-id=12-34" } }
 ```
 
-Node IDs accept `1:2` or URL form `1-2`. The node ID must identify the intended page, section or frame. Subscriptions follow that ID through renames and moves. If the target disappears, `figma.scope.deleted` is emitted once and coverage reports `target_status: "missing"`. The subscription remains available for replay and resumes if the same node is restored; unsubscribe to stop it permanently. Folder/team IDs come from Figma's folder/team URLs; folder IDs replace legacy project IDs in the v2 folder API.
+Node IDs accept `1:2` or URL form `1-2`. The node ID must identify the intended page, section or frame. Subscriptions follow that ID through renames and moves. If the target disappears and remains absent through the quiet period, `figma.scope.deleted` is emitted once and coverage reports `target_status: "missing"`. The subscription remains available for replay and resumes if the same node is restored; unsubscribe to stop it permanently. Folder/team IDs come from Figma's folder/team URLs; folder IDs replace legacy project IDs in the v2 folder API.
 
 Tags match whole, **case-sensitive** tokens: `#bot` matches `Please #bot review`, but not `#botnet` or `#Bot`. By default, each comment/reply must contain the tag itself. With `include_thread_replies: true`, replies also match the root comment's tag. Reactions inherit their comment's filtering. Comment edits match the old or new text, so removing `#bot` still delivers that edit. Deletions retain the last known text and anchor.
 
@@ -164,10 +164,20 @@ Tags match whole, **case-sensitive** tokens: `#bot` matches `Please #bot review`
 | `figma.comment.reopened` | Comment/thread became unresolved |
 | `figma.reaction.added` | Emoji reaction added to a comment or reply |
 | `figma.reaction.removed` | Previously observed emoji reaction removed |
-| `figma.design.changed` | File version/name changed, or nodes within the watched scope changed |
-| `figma.scope.deleted` | Previously observed page/section/frame target disappeared from the document |
+| `figma.design.changed` | Net node changes within the watched scope, or a file rename, after the quiet period |
+| `figma.scope.deleted` | Previously observed page/section/frame target remains absent when its changeset flushes |
 
-Design events contain versions, the watched `target_id` (`null` for a file), affected node IDs, before/after names and hierarchy, and `changed_properties` such as `characters`, `fills` or `children`. Changes are classified as `added`, `updated`, `removed`, `moved`, `entered` or `left`. Both previous and current ancestry are checked when nodes cross scope boundaries. Property values are hashed locally; events report changed property names rather than full before/after document values. The agent can inspect the design through the official Figma MCP. Each event includes up to 1,000 node changes, with `total_changes` and `changes_truncated` explicitly reporting larger deltas.
+Design events contain version IDs (which may be equal before and after an edit), the watched `target_id` (`null` for a file), affected node IDs, before/after names and hierarchy, and `changed_properties` such as `characters`, `fills` or `children`. Changes are classified as `added`, `updated`, `removed`, `moved`, `entered` or `left`. Both previous and current ancestry are checked when nodes cross scope boundaries. Property values are hashed locally; events report changed property names rather than full before/after document values. The agent can inspect the design through the official Figma MCP. Each event includes up to 1,000 node changes, with `total_changes` and `changes_truncated` explicitly reporting larger deltas.
+
+### Design changesets
+
+Each subscription has a **120-second quiet timer**. Every observed design change within its scope resets that timer; changes outside that scope, comments, reactions, and version-ID changes alone do not. A file subscription watches its whole file; folder/team/organization subscriptions share a timer across their discovered files. After the quiet period, a successful design read for every covered file confirms the flush. Polling delays, slow requests, backoff and failed reads can make delivery later than two minutes. Continuous editing keeps the changeset open; there is no forced maximum-age flush.
+
+A flush emits one `figma.design.changed` event per changed file, with the net difference from before the collected edits to the latest observed state. Repeated edits collapse; fully reverted edits and temporary additions/deletions disappear from the result. A target that is deleted and restored during the window does not produce `figma.scope.deleted`. The payload includes `first_observed_at`, `last_observed_at`, and `quiet_period_ms`. Pending changesets persist across restarts and are discarded on unsubscribe. Overlapping subscriptions maintain independent timers and baselines.
+
+Use `--design-quiet SECS` to change the quiet period (default `120`; `0` delivers each observed delta immediately). `listen_status` reports pending changesets and their earliest eligible flush time. The agent does not receive intermediate design deltas. Comments and reactions continue to arrive promptly while a changeset is pending.
+
+Figma's current version is mutable: edits can change its contents without changing its ID. Figma listen compares document snapshots on each design poll; version history does not determine the batch boundaries.
 
 Tool subscriptions persist across restarts. New comments are collected from subscription creation time. Existing comments, reactions and designs establish a baseline on the first successful poll; historical edits are not reconstructed. Subsequent snapshot differences are detected across restarts. A newly added subscription also baselines existing shared snapshots before receiving differences. Upgrading v1.1 state preserves existing subscriptions as **new-comments-only**; create a new subscription to select the additional event types.
 
@@ -216,15 +226,15 @@ This is a draft extension, not an assertion that every MCP host supports it. See
 ## Polling, state, and limits
 
 - Default desired polling interval: **3 seconds**. The producer keeps ticking independently of responses. It submits separate FIFO jobs for comments, reactions, designs and discovery scopes; a resource already queued or running is not submitted again. Overlapping subscriptions share file requests and scope discovery.
-- Design jobs poll `GET /files/:key?depth=1` for the current document version and fetch a shared full document snapshot only when the version/name changes or a baseline is needed. The separate `/meta` endpoint is not used for change detection: live testing found it could report an older version while the document endpoint already exposed an edit. Geometry paths are included to detect vector edits. Scope filtering is applied to the diff; edits elsewhere do not notify a scoped subscriber. Comments may also fetch a document to resolve anchors.
+- Design jobs fetch a shared full document snapshot with geometry paths on each poll and compare property hashes, detecting edits even when Figma keeps the same version ID. This transfers more data than a shallow version check, but overlapping subscriptions still share one design job per file. Scope filtering is applied before changes enter a changeset. Comments may also fetch a document to resolve anchors.
 - Reactions use inline reaction lists when provided, otherwise the paginated reaction endpoint per matching comment. Fallback reads are separate from comment delivery; scoped fallback reactions refresh the document to resolve current anchors. Large reaction subscriptions cost more requests and can take longer to cycle.
 - Jobs dispatch concurrently, with at most **4 HTTP requests in flight** and **2 seconds between request starts** by default. A slow response holds its own slot, not the producer timer or all other requests. If all slots are occupied, additional jobs remain queued. Under saturation, effective per-resource polling slows rather than accumulating duplicate work. The two-second safeguard is our configurable limit, not a universal Figma rule.
 - HTTP **429** pauses the shared HTTP dispatch queue for `Retry-After`; already sent requests may finish, and pending jobs keep their FIFO order. Individual failed file/discovery jobs also retry with exponential backoff, capped at 15 minutes, and reset after a successful attempt. Healthy resources keep running unless a global rate-limit pause applies. Folder discovery refreshes on a five-minute target.
 - `--poll-interval SECS` changes the desired interval (minimum **1 second**). `--request-interval MS` changes global request-start spacing. For example, `--poll-interval 3 --request-interval 1000` targets three seconds while allowing up to one request start per second; use a rate appropriate to your Figma allowance. The desired interval does not override request pacing, concurrency limits, or backoff.
-- Figma publishes PAT limits, but the budget is shared **per user and resource plan**, not independently per token. Comments/reactions are Tier 2; both shallow version checks and full document reads are Tier 1; limits depend on the seat type and the plan containing the file. Other tools or server processes using that account can consume the same budget. See [Figma rate limits](https://developers.figma.com/docs/rest-api/rate-limits/).
+- Figma publishes PAT limits, but the budget is shared **per user and resource plan**, not independently per token. Comments/reactions are Tier 2; design document reads are Tier 1; limits depend on the seat type and the plan containing the file. Other tools or server processes using that account can consume the same budget. See [Figma rate limits](https://developers.figma.com/docs/rest-api/rate-limits/).
 - `listen_status` exposes the desired interval, resource queue depth, active resources, coalesced job count, and the upstream dispatch queue's concurrency and backoff deadline. Coverage reports the most recent successful poll for each subscription.
 - State defaults to `$XDG_STATE_HOME/figma-listen` or `~/.local/state/figma-listen`. Override with `FIGMA_LISTEN_STATE_DIR` or `--state-dir`. One process owns each state directory. State is tied to the authenticated Figma account.
-- The state contains comment/reaction snapshots, node names and hierarchy, design property hashes, subscriptions, seen IDs, and cursors; **never the token**. State files use mode `0600`, newly created state directories `0700`, and writes use atomic rename.
+- The state contains comment/reaction snapshots, node names and hierarchy, design property hashes, pending changesets, subscriptions, seen IDs, and cursors; **never the token**. State files use mode `0600`, newly created state directories `0700`, and writes use atomic rename.
 - The event buffer retains up to **7 days / 10,000 events**, whichever limit comes first. Cursors crossing a retention boundary report `truncated: true`; consumers should report the gap rather than assume complete delivery. Observed IDs survive event eviction so retained comments do not reappear as new events.
 - Discovery is capped at 1,000 folders, 500 files per subscription, 100 subscriptions, and 100,000 observed comment IDs per file. Document snapshots are capped at 100,000 nodes and 200 hierarchy levels. Reaction fallback is capped at 1,000 matching comments per file and 100 pagination cursors per comment. Narrow overly broad scopes or event selections when a limit is reported.
 
@@ -232,7 +242,7 @@ Polling observes the state exposed by Figma REST, not individual editor operatio
 
 The REST API cannot enumerate every team in an organization, so organization subscriptions require explicitly supplied team IDs; this server cannot verify those teams' affiliation. Folder/team discovery excludes undisclosed or inaccessible resources and may omit drafts or files outside the hierarchy. Coverage warnings expose those limits.
 
-Page/section/frame comment filtering uses node anchors and document ancestry. Deletions and edits retain prior anchor context when available. Coordinate-only comments, unknown/deleted anchors and replies whose root is unavailable cannot always be mapped; those gaps are reported in coverage. File-level subscriptions still receive them. Library, variable and other changes absent from the fetched document JSON cannot be localized to a page or section; a file-level version change can still notify a file subscription.
+Page/section/frame comment filtering uses node anchors and document ancestry. Deletions and edits retain prior anchor context when available. Coordinate-only comments, unknown/deleted anchors and replies whose root is unavailable cannot always be mapped; those gaps are reported in coverage. File-level subscriptions still receive them. Library, variable and other changes absent from the fetched document JSON cannot be localized to a page or section; a version-ID change alone does not produce a design event.
 
 ## Development and validation
 
@@ -244,7 +254,7 @@ npm pack
 node scripts/smoke-live.mjs
 ```
 
-Automated tests cover comment lifecycle and reaction deltas, design property diffs, scope movement/deletion, URL scopes, baseline migration and restart replay, paginated reactions, event type selection, filtering, shared polling/discovery, nonblocking FIFO dispatch, bounded concurrency, duplicate coalescing, independent scheduling during slow requests, responsive subscription tools, rate-limit and exponential backoff, authentication error redaction, persistence, retention, both MCP handshake generations, push notifications, replay, and cancellation. CI checks Node 20, 22, and 24. Live testing verified authentication, Codex CLI tool discovery/subscription creation, new comments and untagged replies, comment edits/deletions/resolution/reopening, and reaction additions/removals. Live file-level design changes were also detected, including a metadata-lag bug fixed by switching to shallow document version checks. Page/section/frame filtering and target deletion currently have automated coverage. The tested Codex CLI 0.160.0 exposed retrieval tools but no native event-stream subscription; automatic wakeups remain unverified.
+Automated tests cover comment lifecycle and reaction deltas, design property diffs, scope movement/deletion, URL scopes, baseline migration and restart replay, paginated reactions, event type selection, filtering, shared polling/discovery, nonblocking FIFO dispatch, bounded concurrency, duplicate coalescing, independent scheduling during slow requests, responsive subscription tools, rate-limit and exponential backoff, authentication error redaction, persistence, retention, both MCP handshake generations, push notifications, replay, and cancellation. CI checks Node 20, 22, and 24. Live testing verified authentication, Codex CLI tool discovery/subscription creation, new comments and untagged replies, comment edits/deletions/resolution/reopening, and reaction additions/removals. Live file-level design changes were also detected, including metadata lag and mutable current version IDs. Those findings are covered by regression tests; design detection now compares full snapshots. Automated tests also cover the 120-second quiet boundary, scope isolation, net reverts, restart persistence, failure recovery, overlapping subscriptions and multi-file batches. Page/section/frame filtering and target deletion currently have automated coverage. The tested Codex CLI 0.160.0 exposed retrieval tools but no native event-stream subscription; automatic wakeups remain unverified.
 
 API references: [files](https://developers.figma.com/docs/rest-api/file-endpoints/), [comments](https://developers.figma.com/docs/rest-api/comments-endpoints/), [folders](https://developers.figma.com/docs/rest-api/folders-endpoints/), [scopes](https://developers.figma.com/docs/rest-api/scopes/), [rate limits](https://developers.figma.com/docs/rest-api/rate-limits/).
 

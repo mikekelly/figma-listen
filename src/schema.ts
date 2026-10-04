@@ -67,6 +67,8 @@ export const designPayloadSchema = z.object({
   target_id: z.string().nullable(), version: z.string(), previous_version: z.string(),
   changes: z.array(designChangeSchema), total_changes: z.number(), changes_truncated: z.boolean(),
   metadata_changed: z.boolean(),
+  first_observed_at: z.string().optional(), last_observed_at: z.string().optional(),
+  quiet_period_ms: z.number().nonnegative().optional(),
 }).strict();
 export const eventPayloadSchema = z.union([commentPayloadSchema, designPayloadSchema]);
 export type CommentData = z.infer<typeof commentPayloadSchema>;
@@ -78,6 +80,8 @@ export interface EventOccurrence {
   sequence: number; observedAt: string;
   /** Existing snapshots predate a new subscription; don't replay pre-subscription differences. */
   since?: string;
+  /** Batched designs belong to the subscription whose quiet timer produced them. */
+  subscriptionId?: string;
 }
 export interface Reaction { user: { id: string; handle?: string }; emoji: string; created_at: string }
 export interface Comment {
@@ -94,6 +98,14 @@ export interface NodeSnapshot {
 }
 export interface DesignSnapshot {
   version: string; name: string; observedAt: string; nodes: Record<string, NodeSnapshot>;
+}
+export interface PendingDesign {
+  firstChangedAt: string; lastChangedAt: string;
+  files: Record<string, {
+    version: string; name: string; since: string;
+    /** Original values of touched nodes only; null means the node was added. */
+    nodes: Record<string, NodeSnapshot | null>;
+  }>;
 }
 export interface CommentSnapshot { observedAt: string; comments: Comment[]; data: Record<string, CommentData> }
 export interface Coverage {

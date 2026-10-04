@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { ProtocolError } from '@modelcontextprotocol/server';
 import { FigmaError, indexNodes, type FigmaSource } from './figma.js';
 import { canonical, eventName, subscriptionSchema, tagsIn, targetId, isDesignEvent, reactionSchema,
-  type Comment, type CommentData, type EventData, type EventName, type EventOccurrence, type Reaction, type Subscription, type SubscriptionArguments } from './schema.js';
+  type DesignSnapshot, type Comment, type CommentData, type EventData, type EventName, type EventOccurrence, type Reaction, type Subscription, type SubscriptionArguments } from './schema.js';
 import type { StateStore } from './store.js';
 import { ResourceQueue } from './queue.js';
 import { snapshot, diffNodes, scopeChanges } from './diff.js';
@@ -11,7 +11,7 @@ import { snapshot, diffNodes, scopeChanges } from './diff.js';
 export class ListenError extends ProtocolError {
   constructor(message: string, code = -32602) { super(code, message); }
 }
-export interface DeliveryEvent extends Omit<EventOccurrence, 'sequence' | 'observedAt' | 'since'> { cursor: string }
+export interface DeliveryEvent extends Omit<EventOccurrence, 'sequence' | 'observedAt' | 'since' | 'subscriptionId'> { cursor: string }
 export interface EventBatch {
   events: DeliveryEvent[]; cursor: string; hasMore: boolean; truncated: boolean; nextPollMs: number;
 }
@@ -29,12 +29,13 @@ export class ListenEngine extends EventEmitter {
   private discoveries = new Map<string, { at: number; keys: string[]; warnings: string[] }>();
   private fileNames = new Map<string, string>();
   constructor(readonly store: StateStore, private readonly figma: FigmaSource, readonly options: {
-    pollIntervalMs?: number; discoveryIntervalMs?: number; retentionMs?: number; maxEvents?: number;
+    pollIntervalMs?: number; designQuietPeriodMs?: number; discoveryIntervalMs?: number; retentionMs?: number; maxEvents?: number;
   } = {}) {
     super(); this.setMaxListeners(100);
-    store.state.comments ??= {}; store.state.designs ??= {}; store.state.reactions ??= {};
+    store.state.comments ??= {}; store.state.designs ??= {}; store.state.reactions ??= {}; store.state.pendingDesigns ??= {};
   }
   get interval(): number { return this.options.pollIntervalMs ?? 3000; }
+  get designQuietPeriod(): number { return this.options.designQuietPeriodMs ?? 120000; }
   private serialized<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.tail.then(operation); this.tail = result.catch(() => {}); return result;
   }
@@ -99,6 +100,7 @@ export class ListenEngine extends EventEmitter {
     } catch { throw new ListenError('Invalid cursor or cursor belongs to a different subscription'); }
   }
   private matches(subscription: Subscription, event: EventOccurrence, ignoreAccess = false): boolean {
+    if (event.subscriptionId && event.subscriptionId !== subscription.id) return false;
     const { scope, tag, include_thread_replies, event_types } = subscription.arguments;
     if (!event_types.includes(event.name)) return false;
     if (Date.parse(event.timestamp) < Date.parse(subscription.createdAt) ||
@@ -134,7 +136,7 @@ export class ListenEngine extends EventEmitter {
       sequence = event.sequence;
       if (!this.matches(subscription, event)) continue;
       if (maxAgeMs !== undefined && Date.parse(event.timestamp) < Date.now() - maxAgeMs) { truncated = true; continue; }
-      const { sequence: _, observedAt: __, since: ___, ...publicEvent } = event;
+      const { sequence: _, observedAt: __, since: ___, subscriptionId: ____, ...publicEvent } = event;
       events.push({ ...publicEvent, cursor: this.cursor(id, sequence) });
     }
     if (!hasMore) sequence = this.store.state.sequence;
@@ -150,6 +152,8 @@ export class ListenEngine extends EventEmitter {
   }
   private scopeKey(scope: SubscriptionArguments['scope']): string { return canonical(scope); }
   private removeUnusedDiscoveries(): void {
+    const ids = new Set(this.store.state.subscriptions.map(s => s.id));
+    for (const id of Object.keys(this.store.state.pendingDesigns)) if (!ids.has(id)) delete this.store.state.pendingDesigns[id];
     const active = new Set(this.store.state.subscriptions.map(s => this.scopeKey(s.arguments.scope)));
     for (const key of this.discoveries.keys()) if (!active.has(key)) this.discoveries.delete(key);
   }
@@ -160,7 +164,11 @@ export class ListenEngine extends EventEmitter {
     });
   }
   pollingStatus(): Record<string, unknown> {
-    return { desired_interval_ms: this.interval, request_spacing_ms: this.figma.requestIntervalMs ?? null,
+    return { desired_interval_ms: this.interval, design_quiet_period_ms: this.designQuietPeriod,
+      pending_design_changesets: Object.entries(this.store.state.pendingDesigns).map(([id, pending]) => ({
+        subscription_id: id, file_keys: Object.keys(pending.files), last_changed_at: pending.lastChangedAt,
+        eligible_at: new Date(Date.parse(pending.lastChangedAt) + this.designQuietPeriod).toISOString(),
+      })), request_spacing_ms: this.figma.requestIntervalMs ?? null,
       scheduler: 'FIFO; one pending or running job per resource', ...this.queue.status(),
       upstream_requests: this.figma.requestStatus?.() ?? null };
   }
@@ -297,10 +305,10 @@ export class ListenEngine extends EventEmitter {
       if (errors.length) throw errors[errors.length - 1];
     } finally { this.off('pollError', record); }
   }
-  private append(name: EventName, key: string, data: EventData, timestamp: string, since?: string): void {
+  private append(name: EventName, key: string, data: EventData, timestamp: string, since?: string, subscriptionId?: string): void {
     const sequence = this.store.state.sequence + 1;
     const occurrence: EventOccurrence = { name, data, sequence, timestamp, observedAt: new Date().toISOString(),
-      ...(since ? { since } : {}), eventId: `figma_${createHash('sha256').update(name === eventName ?
+      ...(since ? { since } : {}), ...(subscriptionId ? { subscriptionId } : {}), eventId: `figma_${createHash('sha256').update(name === eventName ?
         `${key}:${(data as CommentData).comment_id}` : `${this.store.state.epoch}:${sequence}:${name}:${canonical(data)}`).digest('hex')}` };
     if (!this.forFile(key).some(sub => this.matches(sub, occurrence))) return;
     this.store.state.sequence = sequence; this.store.state.events.push(occurrence);
@@ -434,38 +442,75 @@ export class ListenEngine extends EventEmitter {
     }
     await this.serialized(async () => { this.success(key, 'reactions'); await this.store.save(); });
   }
-  private async pollDesign(key: string): Promise<void> {
-    if (!this.wants(key, 'design').length) return;
-    const observedAt = new Date().toISOString();
-    const metadata = await this.figma.metadata(key);
-    const previous = this.store.state.designs[key];
-    const changed = !previous || previous.version !== metadata.version || previous.name !== metadata.name;
-    const next = changed
-      ? snapshot(await this.figma.file(key), observedAt) : { ...previous, observedAt };
-    const changes = previous && changed ? diffNodes(previous, next) : [];
-    await this.serialized(async () => {
-      if (this.stopped || !this.wants(key, 'design').length) return;
-      this.denied.delete(`design:${key}`);
-      const targets = new Set(this.wants(key, 'design').map(s => targetId(s.arguments.scope)));
-      if (previous) for (const target of targets) {
-        const scoped = scopeChanges(changes, target);
-        const metadataChanged = target === null && (previous.version !== next.version || previous.name !== next.name);
-        if (!scoped.length && !metadataChanged) continue;
+  /** Only a fresh successful observation can confirm that the scope is quiet. */
+  private flushDesigns(): void {
+    for (const sub of this.store.state.subscriptions) {
+      const pending = this.store.state.pendingDesigns[sub.id];
+      if (!pending) continue;
+      const deadline = Date.parse(pending.lastChangedAt) + this.designQuietPeriod;
+      const files = sub.coverage.file_keys;
+      if (!files.length || files.some(key => this.denied.has(`design:${key}`) ||
+          sub.coverage.resource_errors?.[`design:${key}`] ||
+          !this.store.state.designs[key] || Date.parse(this.store.state.designs[key].observedAt) < deadline)) continue;
+      const target = targetId(sub.arguments.scope);
+      for (const [key, baseline] of Object.entries(pending.files)) {
+        if (!files.includes(key)) continue;
+        const next = this.store.state.designs[key];
+        const beforeNodes: DesignSnapshot['nodes'] = Object.create(null);
+        const afterNodes: DesignSnapshot['nodes'] = Object.create(null);
+        for (const [id, node] of Object.entries(baseline.nodes)) {
+          if (node) beforeNodes[id] = node;
+          if (next.nodes[id]) afterNodes[id] = next.nodes[id];
+        }
+        const before = { ...baseline, observedAt: baseline.since, nodes: beforeNodes };
+        const changes = scopeChanges(diffNodes(before, { ...next, nodes: afterNodes }), target);
+        const metadataChanged = target === null && baseline.name !== next.name;
+        if (!changes.length && !metadataChanged) continue;
         const data = { file_key: key, file_name: next.name,
           url: `https://www.figma.com/design/${encodeURIComponent(key)}${target ? `?${new URLSearchParams({ 'node-id': target })}` : ''}`,
-          target_id: target, version: next.version, previous_version: previous.version,
-          changes: scoped.slice(0, 1000), total_changes: scoped.length, changes_truncated: scoped.length > 1000,
-          metadata_changed: metadataChanged };
-        this.append('figma.design.changed', key, data, observedAt, previous.observedAt);
-        if (target && previous.nodes[target] && !next.nodes[target])
-          this.append('figma.scope.deleted', key, data, observedAt, previous.observedAt);
+          target_id: target, version: next.version, previous_version: baseline.version,
+          changes: changes.slice(0, 1000), total_changes: changes.length, changes_truncated: changes.length > 1000,
+          metadata_changed: metadataChanged, first_observed_at: pending.firstChangedAt,
+          last_observed_at: pending.lastChangedAt, quiet_period_ms: this.designQuietPeriod };
+        this.append('figma.design.changed', key, data, pending.lastChangedAt, baseline.since, sub.id);
+        if (target && beforeNodes[target] && !next.nodes[target])
+          this.append('figma.scope.deleted', key, data, pending.lastChangedAt, baseline.since, sub.id);
       }
+      delete this.store.state.pendingDesigns[sub.id];
+    }
+  }
+  private async pollDesign(key: string): Promise<void> {
+    if (!this.wants(key, 'design').length) return;
+    // Figma mutates the current version in place. Neither a version ID nor a
+    // shallow page tree is a safe gate for changes to descendant properties.
+    const file = await this.figma.file(key);
+    const observedAt = new Date().toISOString();
+    const next = snapshot(file, observedAt);
+    await this.serialized(async () => {
+      if (this.stopped || !this.wants(key, 'design').length) return;
+      const previous = this.store.state.designs[key];
+      const changes = previous ? diffNodes(previous, next) : [];
       for (const sub of this.wants(key, 'design')) {
         const target = targetId(sub.arguments.scope);
+        if (previous && Date.parse(previous.observedAt) >= Date.parse(sub.createdAt)) {
+          const scoped = scopeChanges(changes, target);
+          const renamed = target === null && previous.name !== next.name;
+          if (scoped.length || renamed) {
+            const pending = this.store.state.pendingDesigns[sub.id] ??= {
+              firstChangedAt: observedAt, lastChangedAt: observedAt, files: Object.create(null),
+            };
+            pending.lastChangedAt = observedAt;
+            const baseline = pending.files[key] ??= { version: previous.version, name: previous.name,
+              since: previous.observedAt, nodes: Object.create(null) };
+            for (const change of scoped) if (!Object.hasOwn(baseline.nodes, change.node_id))
+              baseline.nodes[change.node_id] = previous.nodes[change.node_id] ?? null;
+          }
+        }
         if (target) sub.coverage.target_status = next.nodes[target] ? 'present' : 'missing';
       }
       this.store.state.designs[key] = next;
       this.fileNames.set(key, next.name); this.success(key, 'design');
+      this.flushDesigns();
       this.prune(); await this.store.save(); this.emit('events');
     });
   }

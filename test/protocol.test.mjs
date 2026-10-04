@@ -58,7 +58,7 @@ async function wireFixture(t, modern = false) {
       clientInfo: { name: 'figma-listen-test', version: '1' } });
     send('notifications/initialized');
   }
-  return { ...fixtureData, request, send, wait, handle };
+  return { ...fixtureData, request, send, wait, handle, messages };
 }
 
 for (const modern of [false, true]) test(`tools work over ${modern ? '2026 stateless envelopes' : '2025 initialize'} stdio`, async t => {
@@ -128,4 +128,29 @@ test('new event catalog, named push streams and named polling preserve type filt
   assert.deepEqual(result.events.map(e => e.name), ['figma.comment.edited']);
   assert.equal(result.events[0].eventId, pushed.params.eventId);
   send('notifications/cancelled', { requestId: 'edits' }); await eventually(() => engine.listenerCount('events') === 0);
+});
+
+test('design push stream stays silent during edits, then delivers one replayable changeset after quiet', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const { engine, figma, request, send, wait, messages } = await wireFixture(t);
+  const file = await figma.file();
+  figma.file = async () => structuredClone(file);
+  send('events/stream', { name: 'figma.design.changed', arguments: fileScope, cursor: null }, 'designs');
+  const active = await wait(m => m.method === 'notifications/events/active');
+  await engine.tick();
+  t.mock.timers.tick(1000); file.document.children[0].children[0].name = 'First'; await engine.tick();
+  t.mock.timers.tick(60000); file.document.children[0].children[0].name = 'Final'; await engine.tick();
+  t.mock.timers.tick(119999); await engine.tick();
+  const pending = await request('events/poll', { name: 'figma.design.changed', arguments: fileScope, cursor: active.params.cursor });
+  assert.deepEqual(pending.events, []);
+  assert.equal(messages.some(m => m.method === 'notifications/events/event'), false);
+  t.mock.timers.tick(1); await engine.tick();
+  const pushed = await wait(m => m.method === 'notifications/events/event');
+  assert.equal(pushed.params._meta['io.modelcontextprotocol/subscriptionId'], 'designs');
+  assert.equal(pushed.params.data.changes[0].after.name, 'Final');
+  assert.equal(pushed.params.subscriptionId, undefined);
+  const replay = await request('events/poll', { name: 'figma.design.changed', arguments: fileScope, cursor: active.params.cursor });
+  assert.equal(replay.events.length, 1);
+  assert.equal(replay.events[0].eventId, pushed.params.eventId);
+  send('notifications/cancelled', { requestId: 'designs' }); await eventually(() => engine.listenerCount('events') === 0);
 });
