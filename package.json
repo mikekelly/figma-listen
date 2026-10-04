@@ -1,0 +1,58 @@
+{
+  "name": "figma-listen",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run build",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "figma",
+    "mcp",
+    "events",
+    "comments"
+  ],
+  "author": "Mike Kelly",
+  "license": "MIT",
+  "description": "Local Figma comment subscriptions and MCP event delivery",
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.0",
+    "zod": "^4.6.5"
+  },
+  "optionalDependencies": {
+    "@napi-rs/keyring": "^2.1.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.0",
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "bin": {
+    "figma-listen": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/server.js",
+    "./engine": "./dist/engine.js",
+    "./figma": "./dist/figma.js",
+    "./store": "./dist/store.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikekelly/figma-listen.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mikekelly/figma-listen/issues"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}
