@@ -51,3 +51,35 @@ test('recursive v2 discovery deduplicates files and reports partial organization
   assert.equal(paths.filter(p => p === '/v2/folders/root/files').length, 1);
   client.close();
 });
+
+test('design reads use metadata and vector geometry; malformed snapshots fail before diffing', async () => {
+  const paths = [];
+  const client = new FigmaClient('fake', { requestIntervalMs: 0, fetch: async url => {
+    paths.push(url.pathname + url.search);
+    return new Response(JSON.stringify(url.pathname.endsWith('/meta') ? { file: { name: 'Design', version: 'v2' } } :
+      { name: 'Design', version: 'v2', document: { id: '0:0', type: 'DOCUMENT' } }));
+  } });
+  assert.deepEqual(await client.metadata('fileA'), { name: 'Design', version: 'v2' });
+  assert.equal((await client.file('fileA')).document.id, '0:0');
+  assert.deepEqual(paths, ['/v1/files/fileA/meta', '/v1/files/fileA?geometry=paths']);
+  client.close();
+  const invalid = new FigmaClient('fake', { requestIntervalMs: 0, fetch: async () => new Response('{}') });
+  await assert.rejects(invalid.metadata('fileA'), /invalid file metadata/);
+  await assert.rejects(invalid.file('fileA'), /invalid file response/);
+  invalid.close();
+});
+
+test('reaction fallback follows all pages with opaque cursors and rejects incomplete/repeated pagination', async () => {
+  const calls = [];
+  const client = new FigmaClient('fake', { requestIntervalMs: 0, fetch: async url => {
+    calls.push(url.searchParams.get('cursor'));
+    const second = url.searchParams.has('cursor');
+    return new Response(JSON.stringify({ reactions: [{ emoji: second ? ':heart:' : ':+1:' }],
+      pagination: { next_page: second ? null : 'opaque/+?cursor' } }));
+  } });
+  assert.equal((await client.reactions('fileA', 'comment')).length, 2);
+  assert.deepEqual(calls, [null, 'opaque/+?cursor']); client.close();
+  const repeating = new FigmaClient('fake', { requestIntervalMs: 0, fetch: async () =>
+    new Response(JSON.stringify({ reactions: [], pagination: { next_page: 'same' } })) });
+  await assert.rejects(repeating.reactions('fileA', 'comment'), /repeated cursor/); repeating.close();
+});

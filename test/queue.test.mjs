@@ -153,3 +153,21 @@ test('overlapping folder scopes share discovery and newly added tag subscription
   assert.equal(engine.read(tagged.id).events.length, 1);
   await engine.close();
 });
+
+test('slow design fetches leave same-file comments and the independent polling timer running', async t => {
+  const advance = clock(t);
+  const figma = new FakeFigma(); const slow = deferred();
+  const file = await figma.file(); let designReads = 0;
+  figma.file = async () => { designReads++; await slow.promise; return file; };
+  const engine = new ListenEngine(memoryStore(), figma);
+  const sub = await engine.subscribe(fileScope);
+  engine.start(); await advance(0);
+  assert.equal(designReads, 1);
+  figma.snapshots.set('fileA', [comment('new', 'During slow design request')]);
+  await advance(3000);
+  assert.equal(engine.read(sub.id).events[0].data.comment_id, 'new');
+  await advance(3000);
+  assert.equal(designReads, 1, 'one design job stays in flight, with no duplicates');
+  assert.equal(figma.calls.length, 3, 'comments keep polling while the design job waits');
+  slow.resolve(); await settle(); await engine.close();
+});

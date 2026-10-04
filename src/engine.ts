@@ -2,15 +2,16 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { ProtocolError } from '@modelcontextprotocol/server';
 import { FigmaError, indexNodes, type FigmaSource } from './figma.js';
-import { canonical, eventName, subscriptionSchema, tagsIn,
-  type Comment, type EventOccurrence, type Subscription, type SubscriptionArguments } from './schema.js';
+import { canonical, eventName, subscriptionSchema, tagsIn, targetId, isDesignEvent, reactionSchema,
+  type Comment, type CommentData, type EventData, type EventName, type EventOccurrence, type Reaction, type Subscription, type SubscriptionArguments } from './schema.js';
 import type { StateStore } from './store.js';
 import { ResourceQueue } from './queue.js';
+import { snapshot, diffNodes, scopeChanges } from './diff.js';
 
 export class ListenError extends ProtocolError {
   constructor(message: string, code = -32602) { super(code, message); }
 }
-export interface DeliveryEvent extends Omit<EventOccurrence, 'sequence' | 'observedAt'> { cursor: string }
+export interface DeliveryEvent extends Omit<EventOccurrence, 'sequence' | 'observedAt' | 'since'> { cursor: string }
 export interface EventBatch {
   events: DeliveryEvent[]; cursor: string; hasMore: boolean; truncated: boolean; nextPollMs: number;
 }
@@ -29,7 +30,10 @@ export class ListenEngine extends EventEmitter {
   private fileNames = new Map<string, string>();
   constructor(readonly store: StateStore, private readonly figma: FigmaSource, readonly options: {
     pollIntervalMs?: number; discoveryIntervalMs?: number; retentionMs?: number; maxEvents?: number;
-  } = {}) { super(); this.setMaxListeners(100); }
+  } = {}) {
+    super(); this.setMaxListeners(100);
+    store.state.comments ??= {}; store.state.designs ??= {}; store.state.reactions ??= {};
+  }
   get interval(): number { return this.options.pollIntervalMs ?? 3000; }
   private serialized<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.tail.then(operation); this.tail = result.catch(() => {}); return result;
@@ -94,18 +98,25 @@ export class ListenEngine extends EventEmitter {
       return { sequence, truncated: sequence < this.store.state.droppedThrough };
     } catch { throw new ListenError('Invalid cursor or cursor belongs to a different subscription'); }
   }
-  private matches(subscription: Subscription, event: EventOccurrence): boolean {
-    const { scope, tag, include_thread_replies } = subscription.arguments;
-    if (Date.parse(event.timestamp) < Date.parse(subscription.createdAt)) return false;
-    if (this.denied.has(event.data.file_key)) return false;
+  private matches(subscription: Subscription, event: EventOccurrence, ignoreAccess = false): boolean {
+    const { scope, tag, include_thread_replies, event_types } = subscription.arguments;
+    if (!event_types.includes(event.name)) return false;
+    if (Date.parse(event.timestamp) < Date.parse(subscription.createdAt) ||
+        (event.since && Date.parse(event.since) < Date.parse(subscription.createdAt))) return false;
+    const channel = isDesignEvent(event.name) ? 'design' : event.name.startsWith('figma.reaction.') ? 'reactions' : 'comments';
+    if (!ignoreAccess && this.denied.has(`${channel}:${event.data.file_key}`)) return false;
     if ('file_key' in scope) {
       if (event.data.file_key !== scope.file_key) return false;
-      if (scope.kind === 'page' && event.data.page_id !== scope.page_id) return false;
-      if (scope.kind === 'frame' && event.data.node_id !== scope.node_id && !event.data.ancestor_ids.includes(scope.node_id)) return false;
     } else if (!subscription.coverage.file_keys.includes(event.data.file_key)) return false;
+    if ('target_id' in event.data) return event.data.target_id === targetId(scope);
+    const data = event.data;
+    const target = targetId(scope);
+    if (target && ![data, data.previous_location].some(location => location &&
+        (location.node_id === target || location.ancestor_ids.includes(target)))) return false;
     if (!tag) return true;
-    return tagsIn(event.data.text).includes(tag) ||
-      (include_thread_replies && !!event.data.parent_id && event.data.thread_has_tag.includes(tag));
+    return tagsIn(data.text).includes(tag) || tagsIn(data.previous_text ?? '').includes(tag) ||
+      (include_thread_replies && !!data.parent_id &&
+        [...data.thread_has_tag, ...(data.previous_thread_has_tag ?? [])].includes(tag));
   }
   read(id: string, cursor?: string | null, maxEvents = 50, maxAgeMs?: number): EventBatch {
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 100) throw new ListenError('max_events must be between 1 and 100');
@@ -123,7 +134,7 @@ export class ListenEngine extends EventEmitter {
       sequence = event.sequence;
       if (!this.matches(subscription, event)) continue;
       if (maxAgeMs !== undefined && Date.parse(event.timestamp) < Date.now() - maxAgeMs) { truncated = true; continue; }
-      const { sequence: _, observedAt: __, ...publicEvent } = event;
+      const { sequence: _, observedAt: __, since: ___, ...publicEvent } = event;
       events.push({ ...publicEvent, cursor: this.cursor(id, sequence) });
     }
     if (!hasMore) sequence = this.store.state.sequence;
@@ -170,14 +181,42 @@ export class ListenEngine extends EventEmitter {
       }
     });
   }
-  private enqueueFile(key: string): void {
-    this.enqueue(`comments:${key}`, () => this.pollFile(key), async error => {
-      await this.serialized(async () => {
-        if (error instanceof FigmaError && [401,403,404].includes(error.status)) this.denied.add(key);
-        for (const sub of this.forFile(key)) { sub.coverage.complete = false; sub.coverage.last_error = error.message; }
-        await this.store.save();
-      });
+  private wants(key: string, channel: 'comments' | 'design' | 'reactions'): Subscription[] {
+    return this.forFile(key).filter(sub => sub.arguments.event_types.some(name =>
+      channel === 'design' ? isDesignEvent(name) : channel === 'reactions' ? name.startsWith('figma.reaction.') : !isDesignEvent(name)));
+  }
+  private refreshCoverage(sub: Subscription): void {
+    const errors = Object.values(sub.coverage.resource_errors ?? {});
+    if (errors.length) sub.coverage.last_error = errors.join('; '); else delete sub.coverage.last_error;
+    sub.coverage.warnings = [...(this.discoveries.get(this.scopeKey(sub.arguments.scope))?.warnings ?? [])];
+    if (sub.coverage.excluded_unanchored_comments) sub.coverage.warnings.push(
+      'Some comments could not be mapped to a page/section/frame and were excluded from that scoped subscription.');
+    if (sub.coverage.target_status === 'missing') sub.coverage.warnings.push('Watched target is missing; subscription will follow the same node ID if restored.');
+    sub.coverage.complete = !errors.length && !sub.coverage.warnings.length;
+  }
+  private success(key: string, channel: 'comments' | 'design' | 'reactions'): void {
+    this.denied.delete(`${channel}:${key}`);
+    for (const sub of this.wants(key, channel)) {
+      delete sub.coverage.resource_errors?.[`${channel}:${key}`];
+      sub.coverage.last_success_at = new Date().toISOString(); this.refreshCoverage(sub);
+    }
+  }
+  private async failure(key: string, channel: 'comments' | 'design' | 'reactions', error: Error): Promise<void> {
+    await this.serialized(async () => {
+      if (error instanceof FigmaError && [401,403,404].includes(error.status)) {
+        this.denied.add(`${channel}:${key}`);
+        if (channel === 'comments') this.denied.add(`reactions:${key}`);
+      }
+      for (const sub of this.wants(key, channel)) {
+        (sub.coverage.resource_errors ??= {})[`${channel}:${key}`] = error.message;
+        this.refreshCoverage(sub);
+      }
+      await this.store.save();
     });
+  }
+  private enqueueFile(key: string): void {
+    if (this.wants(key, 'comments').length) this.enqueue(`comments:${key}`, () => this.pollFile(key), error => this.failure(key, 'comments', error));
+    if (this.wants(key, 'design').length) this.enqueue(`design:${key}`, () => this.pollDesign(key), error => this.failure(key, 'design', error));
   }
   private enqueueDiscovery(scope: SubscriptionArguments['scope']): void {
     const scopeKey = this.scopeKey(scope);
@@ -193,7 +232,7 @@ export class ListenEngine extends EventEmitter {
         for (const file of result.files) if (file.name) this.fileNames.set(file.key, file.name);
         for (const sub of interested) {
           sub.coverage.file_keys = keys; sub.coverage.warnings = [...result.warnings];
-          sub.coverage.complete = result.warnings.length === 0; delete sub.coverage.last_error;
+          this.refreshCoverage(sub);
         }
         await this.store.save();
         for (const key of keys) this.enqueueFile(key);
@@ -235,8 +274,7 @@ export class ListenEngine extends EventEmitter {
           if (!discovery || Date.now() - discovery.at > (this.options.discoveryIntervalMs ?? 300000)) scopes.set(key, scope);
           if (discovery) {
             sub.coverage.file_keys = [...discovery.keys];
-            sub.coverage.warnings = [...discovery.warnings];
-            sub.coverage.complete = discovery.warnings.length === 0 && !sub.coverage.last_error;
+            this.refreshCoverage(sub);
             for (const file of discovery.keys) files.add(file);
           }
         }
@@ -259,74 +297,175 @@ export class ListenEngine extends EventEmitter {
       if (errors.length) throw errors[errors.length - 1];
     } finally { this.off('pollError', record); }
   }
+  private append(name: EventName, key: string, data: EventData, timestamp: string, since?: string): void {
+    const sequence = this.store.state.sequence + 1;
+    const occurrence: EventOccurrence = { name, data, sequence, timestamp, observedAt: new Date().toISOString(),
+      ...(since ? { since } : {}), eventId: `figma_${createHash('sha256').update(name === eventName ?
+        `${key}:${(data as CommentData).comment_id}` : `${this.store.state.epoch}:${sequence}:${name}:${canonical(data)}`).digest('hex')}` };
+    if (!this.forFile(key).some(sub => this.matches(sub, occurrence))) return;
+    this.store.state.sequence = sequence; this.store.state.events.push(occurrence);
+  }
   private async pollFile(key: string): Promise<void> {
-    if (!this.forFile(key).length) return;
-    // Network waits never hold the state mutation lock. Subscription tools remain responsive.
-    const comments = await this.figma.comments(key);
-    const current = this.forFile(key);
-    const knownBefore = new Set(this.store.state.seen[key] ?? []);
-    const freshBefore = comments.filter(c => !knownBefore.has(c.id));
+    if (!this.wants(key, 'comments').length) return;
+    const observedAt = new Date().toISOString();
+    const comments = [...new Map((await this.figma.comments(key)).map(c => [c.id, c])).values()]
+      .sort((a,b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
+    if (comments.length > 100000) throw new Error('Comment snapshot limit (100000) exceeded');
+    const previous = this.store.state.comments[key];
     let index: ReturnType<typeof indexNodes> | undefined;
     let fileName = this.fileNames.get(key);
-    if (current.some(s => s.arguments.scope.kind === 'page' || s.arguments.scope.kind === 'frame') &&
-        freshBefore.some(c => current.some(s => Date.parse(c.created_at) >= Date.parse(s.createdAt)))) {
+    // Resolve anchors when comment content changes or a newly scoped subscription needs a baseline.
+    if (this.wants(key, 'comments').some(s => targetId(s.arguments.scope)) &&
+        (!previous || canonical(comments) !== canonical(previous.comments) ||
+         this.wants(key, 'comments').some(s => Date.parse(s.createdAt) > Date.parse(previous.observedAt)))) {
       const file = await this.figma.file(key); index = indexNodes(file.document); fileName = file.name;
     }
     await this.serialized(async () => {
-      if (this.stopped) return;
-      const interested = this.forFile(key);
-      if (!interested.length) return;
-      this.denied.delete(key);
+      if (this.stopped || !this.wants(key, 'comments').length) return;
+      const interested = this.wants(key, 'comments');
+      this.denied.delete(`comments:${key}`);
       const known = new Set(this.store.state.seen[key] ?? []);
-      const fresh = [...new Map(comments.filter(c => !known.has(c.id)).map(c => [c.id, c])).values()]
-        .sort((a,b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
-      if (new Set([...known, ...fresh.map(c => c.id)]).size > 100000) throw new Error(
-        'Observed comment limit (100000 per file) reached; use a new state directory');
+      if (new Set([...known, ...comments.map(c => c.id)]).size > 100000)
+        throw new Error('Observed comment limit (100000 per file) reached; use a new state directory');
       const byId = new Map(comments.map(c => [c.id, c]));
-      for (const sub of interested) {
-        const discovery = this.discoveries.get(this.scopeKey(sub.arguments.scope));
-        sub.coverage.warnings = [...(discovery?.warnings ?? [])];
-        sub.coverage.complete = sub.coverage.warnings.length === 0;
-        sub.coverage.excluded_unanchored_comments = 0;
-        delete sub.coverage.last_error;
-      }
-      for (const comment of fresh) {
-        let root: Comment = comment;
+      const oldById = new Map(previous?.comments.map(c => [c.id, c]) ?? []);
+      const data: Record<string, CommentData> = Object.create(null);
+      for (const sub of interested) sub.coverage.excluded_unanchored_comments = 0;
+      for (const comment of comments) {
+        let root = comment;
         const visited = new Set([root.id]);
         while (root.parent_id && byId.has(root.parent_id) && !visited.has(root.parent_id)) {
           root = byId.get(root.parent_id)!; visited.add(root.id);
         }
         const nodeId = root.client_meta?.node_id ?? null;
         const anchor = nodeId ? index?.get(nodeId) : undefined;
-        if (!nodeId || !anchor) for (const sub of interested) {
-          if (Date.parse(comment.created_at) >= Date.parse(sub.createdAt) &&
-              (sub.arguments.scope.kind === 'page' || sub.arguments.scope.kind === 'frame')) {
-            sub.coverage.excluded_unanchored_comments++; sub.coverage.complete = false;
-          }
-        }
-        if (interested.some(s => Date.parse(comment.created_at) >= Date.parse(s.createdAt))) {
-          const sequence = ++this.store.state.sequence;
-          this.store.state.events.push({
-            eventId: `figma_${createHash('sha256').update(`${key}:${comment.id}`).digest('hex')}`,
-            name: eventName, timestamp: comment.created_at, sequence, observedAt: new Date().toISOString(),
-            data: { file_key: key, ...(fileName ? { file_name: fileName } : {}),
-              comment_id: comment.id, thread_id: root.id, parent_id: comment.parent_id || null,
-              text: comment.message, author: { id: comment.user.id,
-                ...(typeof comment.user.handle === 'string' ? { handle: comment.user.handle } : {}) }, created_at: comment.created_at,
-              resolved_at: comment.resolved_at || null, node_id: nodeId, page_id: anchor?.pageId ?? null,
-              ancestor_ids: anchor?.ancestors ?? [], thread_has_tag: tagsIn(root.message),
-              url: `https://www.figma.com/design/${encodeURIComponent(key)}?${new URLSearchParams({
-                ...(nodeId ? { 'node-id': nodeId } : {}), 'comment-id': comment.id }).toString()}` },
-          });
+        const oldData = previous?.data[comment.id];
+        const reusable = !index && oldData?.node_id === nodeId;
+        const payload: CommentData = {
+          file_key: key, ...(fileName ? { file_name: fileName } : {}),
+          comment_id: comment.id, thread_id: root.id, parent_id: comment.parent_id || null,
+          text: comment.message, author: { id: comment.user.id,
+            ...(typeof comment.user.handle === 'string' ? { handle: comment.user.handle } : {}) },
+          created_at: comment.created_at, resolved_at: comment.resolved_at || null,
+          node_id: nodeId, page_id: anchor?.pageId ?? (reusable ? oldData.page_id : null),
+          ancestor_ids: anchor?.ancestors ?? (reusable ? oldData.ancestor_ids : []), thread_has_tag: tagsIn(root.message),
+          url: `https://www.figma.com/design/${encodeURIComponent(key)}?${new URLSearchParams({
+            ...(nodeId ? { 'node-id': nodeId } : {}), 'comment-id': comment.id })}`,
+        };
+        data[comment.id] = payload;
+        if (!payload.page_id) for (const sub of interested) if (targetId(sub.arguments.scope)) sub.coverage.excluded_unanchored_comments++;
+        const old = oldById.get(comment.id);
+        if (!known.has(comment.id)) this.append(eventName, key, payload, comment.created_at);
+        else if (old && oldData) {
+          const delta = { ...payload, previous_text: oldData.text, previous_thread_has_tag: oldData.thread_has_tag,
+            previous_location: { node_id: oldData.node_id, page_id: oldData.page_id, ancestor_ids: oldData.ancestor_ids } };
+          if (old.message !== comment.message || canonical(old.client_meta) !== canonical(comment.client_meta))
+            this.append('figma.comment.edited', key, delta, observedAt, previous!.observedAt);
+          if (!!old.resolved_at !== !!comment.resolved_at) this.append(comment.resolved_at ? 'figma.comment.resolved' : 'figma.comment.reopened',
+            key, { ...delta, previous_resolved_at: old.resolved_at || null }, observedAt, previous!.observedAt);
         }
         known.add(comment.id);
       }
-      this.store.state.seen[key] = [...known];
-      for (const sub of interested) {
-        sub.coverage.last_success_at = new Date().toISOString();
-        if (sub.coverage.excluded_unanchored_comments) sub.coverage.warnings.push(
-          'Some comments could not be mapped to a page/frame and were excluded from that scoped subscription.');
+      if (previous) for (const old of previous.comments) if (!byId.has(old.id) && previous.data[old.id]) {
+        this.append('figma.comment.deleted', key, previous.data[old.id], observedAt, previous.observedAt);
+        delete this.store.state.reactions[`${key}:${old.id}`];
       }
+      this.store.state.seen[key] = [...known];
+      this.store.state.comments[key] = { observedAt, comments: structuredClone(comments), data };
+      this.success(key, 'comments');
+      this.prune(); await this.store.save(); this.emit('events');
+      if (this.wants(key, 'reactions').length) this.enqueue(`reactions:${key}`, () => this.pollReactions(key), error => this.failure(key, 'reactions', error));
+    });
+  }
+  private async pollReactions(key: string): Promise<void> {
+    const baseline = this.store.state.comments[key];
+    if (!baseline || !this.wants(key, 'reactions').length || this.denied.has(`comments:${key}`)) return;
+    let reactionIndex: ReturnType<typeof indexNodes> | undefined;
+    // Fallback reactions may change without changing the comments response. Resolve their current scope.
+    if (baseline.comments.some(c => c.reactions === undefined) &&
+        this.wants(key, 'reactions').some(s => targetId(s.arguments.scope))) {
+      reactionIndex = indexNodes((await this.figma.file(key)).document);
+    }
+    const reactionData = (id: string): CommentData | undefined => {
+      const data = this.store.state.comments[key]?.data[id];
+      if (!data || !reactionIndex) return data;
+      const anchor = data.node_id ? reactionIndex.get(data.node_id) : undefined;
+      return { ...data, page_id: anchor?.pageId ?? null, ancestor_ids: anchor?.ancestors ?? [] };
+    };
+    // Only comments that match a reaction subscription need per-comment fallback requests.
+    const interested = baseline.comments.filter(comment => {
+      const data = reactionData(comment.id);
+      return data && this.wants(key, 'reactions').some(sub => this.matches(sub, {
+        eventId: '', sequence: 0, timestamp: new Date().toISOString(), observedAt: '',
+        name: sub.arguments.event_types.includes('figma.reaction.added') ? 'figma.reaction.added' : 'figma.reaction.removed', data,
+      }, true));
+    });
+    if (interested.filter(c => c.reactions === undefined).length > 1000)
+      throw new Error('Reaction fallback limit (1000 comments per file) exceeded; narrow the scope or use a tag');
+    for (const comment of interested) {
+      if (this.stopped || !this.wants(key, 'reactions').length) return;
+      const observedAt = new Date().toISOString();
+      let raw: Reaction[];
+      try { raw = comment.reactions ?? await this.figma.reactions(key, comment.id); }
+      catch (error) {
+        // A comment may disappear between the list and reaction requests. Don't infer reaction removals.
+        if (error instanceof FigmaError && error.status === 404) continue;
+        throw error;
+      }
+      const items = raw.map(item => reactionSchema.parse({ emoji: item.emoji, created_at: item.created_at,
+        user: { id: item.user.id, ...(typeof item.user.handle === 'string' ? { handle: item.user.handle } : {}) } }));
+      await this.serialized(async () => {
+        if (this.stopped || this.denied.has(`comments:${key}`)) return;
+        const current = reactionData(comment.id);
+        if (!current) return;
+        const resource = `${key}:${comment.id}`;
+        const previous = this.store.state.reactions[resource];
+        const identity = (item: Reaction) => canonical([item.user.id, item.emoji]);
+        const before = new Map(previous?.items.map(item => [identity(item), item]) ?? []);
+        const after = new Map(items.map(item => [identity(item), item]));
+        this.denied.delete(`reactions:${key}`);
+        for (const [id, reaction] of after) if (!before.has(id)) this.append('figma.reaction.added', key,
+          { ...current, reaction }, previous ? observedAt : reaction.created_at, previous?.observedAt);
+        if (previous) for (const [id, reaction] of before) if (!after.has(id)) this.append('figma.reaction.removed', key,
+          { ...current, reaction }, observedAt, previous.observedAt);
+        this.store.state.reactions[resource] = { observedAt, items: [...after.values()] };
+        this.prune(); await this.store.save(); this.emit('events');
+      });
+    }
+    await this.serialized(async () => { this.success(key, 'reactions'); await this.store.save(); });
+  }
+  private async pollDesign(key: string): Promise<void> {
+    if (!this.wants(key, 'design').length) return;
+    const observedAt = new Date().toISOString();
+    const metadata = await this.figma.metadata(key);
+    const previous = this.store.state.designs[key];
+    const changed = !previous || previous.version !== metadata.version || previous.name !== metadata.name;
+    const next = changed
+      ? snapshot(await this.figma.file(key), observedAt) : { ...previous, observedAt };
+    const changes = previous && changed ? diffNodes(previous, next) : [];
+    await this.serialized(async () => {
+      if (this.stopped || !this.wants(key, 'design').length) return;
+      this.denied.delete(`design:${key}`);
+      const targets = new Set(this.wants(key, 'design').map(s => targetId(s.arguments.scope)));
+      if (previous) for (const target of targets) {
+        const scoped = scopeChanges(changes, target);
+        const metadataChanged = target === null && (previous.version !== next.version || previous.name !== next.name);
+        if (!scoped.length && !metadataChanged) continue;
+        const data = { file_key: key, file_name: next.name,
+          url: `https://www.figma.com/design/${encodeURIComponent(key)}${target ? `?${new URLSearchParams({ 'node-id': target })}` : ''}`,
+          target_id: target, version: next.version, previous_version: previous.version,
+          changes: scoped.slice(0, 1000), total_changes: scoped.length, changes_truncated: scoped.length > 1000,
+          metadata_changed: metadataChanged };
+        this.append('figma.design.changed', key, data, observedAt, previous.observedAt);
+        if (target && previous.nodes[target] && !next.nodes[target])
+          this.append('figma.scope.deleted', key, data, observedAt, previous.observedAt);
+      }
+      for (const sub of this.wants(key, 'design')) {
+        const target = targetId(sub.arguments.scope);
+        if (target) sub.coverage.target_status = next.nodes[target] ? 'present' : 'missing';
+      }
+      this.store.state.designs[key] = next;
+      this.fileNames.set(key, next.name); this.success(key, 'design');
       this.prune(); await this.store.save(); this.emit('events');
     });
   }

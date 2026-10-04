@@ -5,7 +5,7 @@ import { StateStore } from '../dist/store.js';
 import { ListenEngine } from '../dist/engine.js';
 
 export const comment = (id, message, extra = {}) => ({ id, message,
-  created_at: new Date(Date.now() + 1000).toISOString(), user: { id: 'user', handle: 'Designer' }, ...extra });
+  created_at: new Date(Date.now() + 1000).toISOString(), user: { id: 'user', handle: 'Designer' }, reactions: [], ...extra });
 export const fileScope = { scope: { kind: 'file', file_key: 'fileA' } };
 export class FakeFigma {
   snapshots = new Map([['fileA', []]]);
@@ -15,7 +15,9 @@ export class FakeFigma {
   async me() { return { id: 'user' }; }
   async comments(key) { this.calls.push(key); if (this.error) throw this.error; return this.snapshots.get(key) ?? []; }
   async discover(scope) { return { files: 'file_key' in scope ? [{ key: scope.file_key }] : this.discovered, warnings: [] }; }
-  async file() { return { name: 'Design', document: { id: '0:0', type: 'DOCUMENT', children: [
+  async metadata() { return { name: 'Design', version: '1' }; }
+  async reactions() { return []; }
+  async file() { return { name: 'Design', version: '1', document: { id: '0:0', type: 'DOCUMENT', children: [
     { id: '1:1', type: 'CANVAS', children: [{ id: '2:1', type: 'FRAME', children: [{ id: '3:1', type: 'TEXT' }] }] },
     { id: '1:2', type: 'CANVAS', children: [{ id: '4:1', type: 'TEXT' }] },
   ] } }; }

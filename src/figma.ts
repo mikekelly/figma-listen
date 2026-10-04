@@ -1,4 +1,4 @@
-import type { Comment, FileNode, FileReference, SubscriptionArguments } from './schema.js';
+import type { Comment, FileNode, FileDocument, FileReference, Reaction, SubscriptionArguments } from './schema.js';
 import { ResourceQueue } from './queue.js';
 
 export class FigmaError extends Error {
@@ -11,7 +11,9 @@ export interface FigmaSource {
   requestStatus?(): ReturnType<ResourceQueue['status']>;
   me(): Promise<{ id: string; handle?: string }>;
   comments(key: string): Promise<Comment[]>;
-  file(key: string): Promise<{ name: string; document: FileNode }>;
+  file(key: string): Promise<FileDocument>;
+  metadata(key: string): Promise<{ name: string; version: string }>;
+  reactions(key: string, commentId: string): Promise<Reaction[]>;
   discover(scope: SubscriptionArguments['scope']): Promise<{ files: FileReference[]; warnings: string[] }>;
 }
 
@@ -64,10 +66,36 @@ export class FigmaClient implements FigmaSource {
         throw new Error('Figma returned an invalid comment');
       }
     }
+    if (response.comments.length > 100000) throw new Error('Comment snapshot limit (100000) exceeded');
     return response.comments;
   }
-  file(key: string): Promise<{ name: string; document: FileNode }> {
-    return this.get(`/v1/files/${encodeURIComponent(key)}`);
+  async file(key: string): Promise<FileDocument> {
+    const file = await this.get<FileDocument>(`/v1/files/${encodeURIComponent(key)}?geometry=paths`);
+    if (!file.document || typeof file.name !== 'string' || typeof file.version !== 'string')
+      throw new Error('Figma returned an invalid file response');
+    return file;
+  }
+  async metadata(key: string): Promise<{ name: string; version: string }> {
+    const result = await this.get<{ file: { name: string; version: string } }>(`/v1/files/${encodeURIComponent(key)}/meta`);
+    if (typeof result.file?.version !== 'string' || typeof result.file?.name !== 'string')
+      throw new Error('Figma returned invalid file metadata');
+    return { name: result.file.name, version: result.file.version };
+  }
+  async reactions(key: string, commentId: string): Promise<Reaction[]> {
+    const result: Reaction[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const path = `/v1/files/${encodeURIComponent(key)}/comments/${encodeURIComponent(commentId)}/reactions`;
+      const page = await this.get<{ reactions: Reaction[]; pagination?: { next_page?: string | null } }>(
+        path + (cursor ? `?${new URLSearchParams({ cursor })}` : ''));
+      if (!Array.isArray(page.reactions)) throw new Error('Figma returned invalid reactions');
+      result.push(...page.reactions);
+      cursor = page.pagination?.next_page || undefined;
+      if (cursor && (cursors.has(cursor) || cursors.size >= 100)) throw new Error('Reaction pagination limit or repeated cursor');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return result;
   }
   private async folders(path: string): Promise<{ id: string; name?: string }[]> {
     const result = await this.get<{ folders: { id: string; name?: string }[] }>(path);
@@ -117,6 +145,9 @@ export interface Anchor { pageId: string | null; ancestors: string[] }
 export function indexNodes(document: FileNode): Map<string, Anchor> {
   const index = new Map<string, Anchor>();
   const visit = (node: FileNode, pageId: string | null, ancestors: string[]) => {
+    if (!node || typeof node.id !== 'string' || typeof node.type !== 'string' || index.has(node.id))
+      throw new Error('Figma returned an invalid or duplicate document node');
+    if (index.size >= 100000 || ancestors.length > 200) throw new Error('Document index limit exceeded (100000 nodes / 200 levels)');
     const page = node.type === 'CANVAS' ? node.id : pageId;
     index.set(node.id, { pageId: page, ancestors });
     for (const child of node.children ?? []) visit(child, page, [...ancestors, node.id]);

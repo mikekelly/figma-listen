@@ -104,7 +104,28 @@ test('stream cancellation preserves a subscription created or promoted by a tool
   const { engine, send, wait, request } = await wireFixture(t);
   send('events/stream', { name: 'figma.comment.created', arguments: fileScope, cursor: null }, 'persistent');
   await wait(m => m.method === 'notifications/events/active');
-  await request('tools/call', { name: 'listen_subscribe', arguments: fileScope });
+  await request('tools/call', { name: 'listen_subscribe', arguments: { ...fileScope, event_types: ['figma.comment.created'] } });
   send('notifications/cancelled', { requestId: 'persistent' }); await eventually(() => engine.listenerCount('events') === 0);
   assert.equal(engine.subscriptions()[0].source, 'tool');
+});
+
+test('new event catalog, named push streams and named polling preserve type filters and replay', async t => {
+  const { engine, figma, request, send, wait } = await wireFixture(t);
+  const catalog = await request('events/list');
+  assert.equal(catalog.events.length, 9);
+  assert.ok(catalog.events.some(e => e.name === 'figma.design.changed'));
+  assert.ok(catalog.events.some(e => e.name === 'figma.reaction.removed'));
+  send('events/stream', { name: 'figma.comment.edited', arguments: fileScope, cursor: null }, 'edits');
+  const active = await wait(m => m.method === 'notifications/events/active');
+  const root = comment('old', 'Before', { created_at: '2020-01-01T00:00:00Z' });
+  figma.snapshots.set('fileA', [root]); await engine.tick();
+  figma.snapshots.set('fileA', [{ ...root, message: 'After' }, comment('new', 'Not an edit')]); await engine.tick();
+  const pushed = await wait(m => m.method === 'notifications/events/event');
+  assert.equal(pushed.params.name, 'figma.comment.edited');
+  assert.equal(pushed.params.data.previous_text, 'Before');
+  assert.equal(pushed.params.since, undefined, 'internal baseline timestamp is not exposed');
+  const result = await request('events/poll', { name: 'figma.comment.edited', arguments: fileScope, cursor: active.params.cursor });
+  assert.deepEqual(result.events.map(e => e.name), ['figma.comment.edited']);
+  assert.equal(result.events[0].eventId, pushed.params.eventId);
+  send('notifications/cancelled', { requestId: 'edits' }); await eventually(() => engine.listenerCount('events') === 0);
 });
