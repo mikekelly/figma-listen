@@ -19,8 +19,14 @@ export class StateStore {
   state!: State;
   private locked = false;
   private saveTail: Promise<void> = Promise.resolve();
-  constructor(readonly directory: string) {}
+  constructor(readonly directory?: string) {}
   async open(ownerId: string): Promise<void> {
+    if (!this.directory) {
+      this.state = { version: 1, epoch: randomUUID(), ownerId, sequence: 0,
+        subscriptions: [], seen: {}, events: [], comments: {}, designs: {}, pendingDesigns: {}, reactions: {}, droppedThrough: 0 };
+      this.locked = true;
+      return;
+    }
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const lockPath = join(this.directory, 'process.lock');
     try {
@@ -58,10 +64,12 @@ export class StateStore {
   }
   async save(): Promise<void> {
     if (!this.locked) throw new Error('Cannot save closed state store');
+    if (!this.directory) return;
+    const directory = this.directory;
     const serialized = JSON.stringify(this.state);
     this.saveTail = this.saveTail.catch(() => {}).then(async () => {
-      const destination = join(this.directory, 'state.json');
-      const temporary = join(this.directory, `state.${process.pid}.tmp`);
+      const destination = join(directory, 'state.json');
+      const temporary = join(directory, `state.${process.pid}.tmp`);
       await writeFile(temporary, serialized, { mode: 0o600 });
       await rename(temporary, destination);
     });
@@ -69,6 +77,9 @@ export class StateStore {
   }
   async close(): Promise<void> {
     await this.saveTail.catch(() => {});
-    if (this.locked) { this.locked = false; await unlink(join(this.directory, 'process.lock')).catch(() => {}); }
+    if (this.locked) {
+      this.locked = false;
+      if (this.directory) await unlink(join(this.directory, 'process.lock')).catch(() => {});
+    }
   }
 }

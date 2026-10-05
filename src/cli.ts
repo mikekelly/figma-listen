@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { authenticate, credentialEntry, loadToken } from './auth.js';
 import { FigmaClient } from './figma.js';
@@ -19,7 +18,7 @@ Usage: figma-listen [auth|logout|doctor] [options]
   doctor                Validate authentication and report configuration
 
 Options:
-  --state-dir PATH      Persistent state directory (one process per directory)
+  --state-dir PATH      Opt into persistent state (one process per directory)
   --poll-interval SECS  Desired resource polling interval; default 3, minimum 1
   --request-interval MS Minimum spacing between Figma requests; default 2000
   --design-quiet SECS   Flush design changes after this quiet period; default 120
@@ -27,7 +26,8 @@ Options:
   --version             Print version
 
 FIGMA_ACCESS_TOKEN overrides saved credentials.
-FIGMA_LISTEN_STATE_DIR overrides the default state directory.
+State stays in memory by default, independently for each MCP process.
+FIGMA_LISTEN_STATE_DIR also opts into persistent state.
 Push requires an MCP Events capable host. Retrieval tools work on ordinary MCP clients.
 `;
 async function main(): Promise<void> {
@@ -49,8 +49,8 @@ async function main(): Promise<void> {
   const spacing = Number(values['request-interval'] ?? 2000);
   if (!Number.isFinite(interval) || interval < 1000 || interval > 86400000) throw new Error('--poll-interval must be between 1 and 86400 seconds');
   if (!Number.isFinite(spacing) || spacing < 0 || spacing > 60000) throw new Error('--request-interval must be between 0 and 60000 milliseconds');
-  const directory = resolve(values['state-dir'] ?? process.env.FIGMA_LISTEN_STATE_DIR ??
-    join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'figma-listen'));
+  const configuredDirectory = values['state-dir'] ?? process.env.FIGMA_LISTEN_STATE_DIR;
+  const directory = configuredDirectory ? resolve(configuredDirectory) : undefined;
   const figma = new FigmaClient(await loadToken(), { requestIntervalMs: spacing });
   let engine: ListenEngine | undefined;
   let shutdown: (() => Promise<void>) | undefined;
@@ -60,7 +60,8 @@ async function main(): Promise<void> {
     if (positionals[0] === 'doctor') {
       process.stdout.write(JSON.stringify({ version: VERSION, authenticated: true, user_id: user.id,
         token_source: process.env.FIGMA_ACCESS_TOKEN?.trim() ? 'environment' : 'credential_store',
-        state_directory: directory, poll_interval_ms: interval, design_quiet_period_ms: quiet, request_interval_ms: spacing,
+        state_storage: directory ? 'disk' : 'memory', state_directory: directory ?? null,
+        poll_interval_ms: interval, design_quiet_period_ms: quiet, request_interval_ms: spacing,
         polling_scheduler: 'FIFO; one pending or running job per resource',
         required_scopes: ['current_user:read','file_comments:read'],
         optional_scopes: ['file_content:read','folders:read'],

@@ -14,7 +14,7 @@ async function eventually(predicate) {
   assert.fail('Expected state transition did not complete');
 }
 
-async function wireFixture(t, modern = false) {
+async function wireFixture(t, modern = false, serverOptions = {}) {
   const fixtureData = await fixture(t);
   const stdin = new PassThrough(); const stdout = new PassThrough();
   const messages = []; let partial = ''; const waiters = new Set();
@@ -26,7 +26,7 @@ async function wireFixture(t, modern = false) {
     for (const check of waiters) check();
   });
   const transport = new StdioServerTransport(stdin, stdout);
-  const handle = serveStdio(() => createServer(fixtureData.engine), { transport });
+  const handle = serveStdio(() => createServer(fixtureData.engine, serverOptions), { transport });
   t.after(async () => { await handle.close(); stdin.destroy(); stdout.destroy(); });
   let nextId = 0;
   const meta = modern ? {
@@ -60,6 +60,21 @@ async function wireFixture(t, modern = false) {
   }
   return { ...fixtureData, request, send, wait, handle, messages };
 }
+
+for (const modern of [false, true]) test(`native-only server exposes no fallback tools and streams events (${modern ? '2026' : '2025'})`, async t => {
+  const { request, send, wait, engine, figma } = await wireFixture(t, modern, { tools: false });
+  assert.deepEqual((await request('tools/list')).tools, []);
+  assert.equal((await request('events/list')).events.length, 9);
+  send('events/stream', { name: 'figma.comment.created', arguments: fileScope, cursor: null }, 'native');
+  await wait(m => m.method === 'notifications/events/active');
+  await engine.tick();
+  figma.snapshots.set('fileA', [comment('native-only', 'Native push')]);
+  await engine.tick();
+  const event = await wait(m => m.method === 'notifications/events/event');
+  assert.equal(event.params.data.comment_id, 'native-only');
+  send('notifications/cancelled', { requestId: 'native' });
+  await eventually(() => engine.listenerCount('events') === 0);
+});
 
 for (const modern of [false, true]) test(`tools work over ${modern ? '2026 stateless envelopes' : '2025 initialize'} stdio`, async t => {
   const { request, engine, figma } = await wireFixture(t, modern);

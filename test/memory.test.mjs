@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { StateStore } from '../dist/store.js';
+import { ListenEngine } from '../dist/engine.js';
+import { FakeFigma, comment, fileScope } from './helpers.mjs';
+
+test('parallel in-memory listeners isolate subscriptions, events and lifecycle', async t => {
+  const stores = [new StateStore(), new StateStore()];
+  await Promise.all(stores.map(store => store.open('user')));
+  const figma = new FakeFigma();
+  const [left, right] = stores.map(store => new ListenEngine(store, figma));
+  t.after(() => Promise.all([left.close(), right.close()]));
+  const a = await left.subscribe({ ...fileScope, tag: '#left' });
+  const b = await right.subscribe({ ...fileScope, tag: '#right' });
+  await Promise.all([left.tick(), right.tick()]);
+  figma.snapshots.set('fileA', [comment('a', '#left'), comment('b', '#right')]);
+  await Promise.all([left.tick(), right.tick()]);
+  assert.deepEqual(left.read(a.id).events.map(e => e.data.comment_id), ['a']);
+  assert.deepEqual(right.read(b.id).events.map(e => e.data.comment_id), ['b']);
+  assert.equal(left.subscriptions().length, 1);
+  assert.equal(right.subscriptions().length, 1);
+  assert.notEqual(stores[0].state.epoch, stores[1].state.epoch);
+  await left.close();
+  figma.snapshots.get('fileA').push(comment('c', '#right'));
+  await right.tick();
+  assert.equal(right.read(b.id).events.length, 2);
+  const restarted = new StateStore();
+  await restarted.open('user');
+  assert.equal(restarted.state.subscriptions.length, 0);
+  assert.equal(restarted.state.events.length, 0);
+  await restarted.close();
+  await assert.rejects(restarted.save(), /closed state store/);
+});
