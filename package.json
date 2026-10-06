@@ -1,6 +1,6 @@
 {
-  "name": "@realmikekelly/figma-listen",
-  "version": "1.3.1",
+  "name": "@realmikekelly/figma-watch",
+  "version": "2.0.0",
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
@@ -13,11 +13,12 @@
     "figma",
     "mcp",
     "events",
-    "comments"
+    "comments",
+    "watch"
   ],
   "author": "Mike Kelly",
   "license": "MIT",
-  "description": "Local Figma comment, reaction and design-change subscriptions over MCP",
+  "description": "Watch Figma comments, reactions and design changes over MCP, and comment back without echoes",
   "dependencies": {
     "@modelcontextprotocol/server": "^2.3.0",
     "zod": "^4.6.5"
@@ -32,7 +33,7 @@
   },
   "type": "module",
   "bin": {
-    "figma-listen": "dist/cli.js"
+    "figma-watch": "dist/cli.js"
   },
   "exports": {
     ".": "./dist/server.js",
@@ -47,10 +48,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mikekelly/figma-listen.git"
+    "url": "git+https://github.com/mikekelly/figma-watch.git"
   },
   "bugs": {
-    "url": "https://github.com/mikekelly/figma-listen/issues"
+    "url": "https://github.com/mikekelly/figma-watch/issues"
   },
   "engines": {
     "node": ">=20.19"

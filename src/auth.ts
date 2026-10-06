@@ -1,10 +1,12 @@
 import type { AsyncEntry } from '@napi-rs/keyring';
 import { FigmaClient } from './figma.js';
 
-export async function credentialEntry(): Promise<AsyncEntry> {
+/** Tokens saved before the rename to figma-watch live under the old service name. */
+const LEGACY_SERVICE = 'figma-listen';
+export async function credentialEntry(service = 'figma-watch'): Promise<AsyncEntry> {
   try {
     const { AsyncEntry } = await import('@napi-rs/keyring');
-    return new AsyncEntry('figma-listen', 'figma-access-token',
+    return new AsyncEntry(service, 'figma-access-token',
       process.platform === 'linux' ? { linux: { store: 'secret-service' } } : undefined);
   } catch {
     throw new Error('System credential store unavailable. Export FIGMA_ACCESS_TOKEN instead. Linux auth requires a running Secret Service.');
@@ -14,10 +16,21 @@ export async function loadToken(env: NodeJS.ProcessEnv = process.env): Promise<s
   const configured = env.FIGMA_ACCESS_TOKEN?.trim();
   if (configured) return configured;
   try {
-    const saved = await (await credentialEntry()).getPassword();
+    const entry = await credentialEntry();
+    const saved = await entry.getPassword();
     if (saved?.trim()) return saved.trim();
+    const legacy = (await (await credentialEntry(LEGACY_SERVICE)).getPassword())?.trim();
+    if (legacy) {
+      // Copy rather than move, so an older figma-listen install keeps working.
+      await entry.setPassword(legacy).catch(() => {});
+      return legacy;
+    }
   } catch { /* Environment authentication still works without the optional keyring dependency. */ }
-  throw new Error('No Figma token. Export FIGMA_ACCESS_TOKEN or run figma-listen auth.');
+  throw new Error('No Figma token. Export FIGMA_ACCESS_TOKEN or run figma-watch auth.');
+}
+/** Removes the saved token, including any copy saved by figma-listen. */
+export async function forgetToken(): Promise<void> {
+  for (const service of ['figma-watch', LEGACY_SERVICE]) await (await credentialEntry(service)).deleteCredential();
 }
 /** A terminal-only hidden prompt; secrets never enter stdout or command arguments. */
 export async function promptToken(): Promise<string> {

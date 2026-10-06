@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ResourceQueue } from '../dist/queue.js';
 import { FigmaClient } from '../dist/figma.js';
-import { ListenEngine } from '../dist/engine.js';
+import { WatchEngine } from '../dist/engine.js';
 import { FakeFigma, fileScope, comment } from './helpers.mjs';
 
 const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
@@ -102,7 +102,7 @@ test('three-second producer continues during slow work, bounds duplicates, and l
     if (key === 'fileA') await slow.promise;
     return [];
   };
-  const engine = new ListenEngine(memoryStore(), figma);
+  const engine = new WatchEngine(memoryStore(), figma);
   const a = await engine.subscribe(fileScope);
   await engine.subscribe({ scope: { kind: 'file', file_key: 'fileB' } });
   engine.start(); await advance(0);
@@ -125,7 +125,7 @@ test('failed resources back off exponentially without slowing healthy resources,
     if (key === 'fileA' && failing) throw new Error('temporary failure');
     return [];
   };
-  const engine = new ListenEngine(memoryStore(), figma);
+  const engine = new WatchEngine(memoryStore(), figma);
   await engine.subscribe(fileScope);
   await engine.subscribe({ scope: { kind: 'file', file_key: 'fileB' } });
   engine.start(); await advance(0);
@@ -143,7 +143,7 @@ test('failed resources back off exponentially without slowing healthy resources,
 test('overlapping folder scopes share discovery and newly added tag subscriptions reuse the coverage', async () => {
   const figma = new FakeFigma(); let discoveries = 0;
   figma.discover = async () => { discoveries++; return { files: [{ key: 'fileA' }], warnings: [] }; };
-  const engine = new ListenEngine(memoryStore(), figma);
+  const engine = new WatchEngine(memoryStore(), figma);
   const scope = { kind: 'folder', folder_id: 'folderA' };
   await engine.subscribe({ scope }); await engine.subscribe({ scope, tag: '#other' });
   await engine.tick(); assert.equal(discoveries, 1);
@@ -159,7 +159,7 @@ test('slow design fetches leave same-file comments and the independent polling t
   const figma = new FakeFigma(); const slow = deferred();
   const file = await figma.file(); let designReads = 0;
   figma.file = async () => { designReads++; await slow.promise; return file; };
-  const engine = new ListenEngine(memoryStore(), figma);
+  const engine = new WatchEngine(memoryStore(), figma);
   const sub = await engine.subscribe(fileScope);
   engine.start(); await advance(0);
   assert.equal(designReads, 1);

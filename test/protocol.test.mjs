@@ -4,6 +4,7 @@ import { PassThrough } from 'node:stream';
 import { serveStdio, StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { PROTOCOL_VERSION_META_KEY, CLIENT_INFO_META_KEY, CLIENT_CAPABILITIES_META_KEY } from '@modelcontextprotocol/server';
 import { createServer } from '../dist/server.js';
+import { FigmaError } from '../dist/figma.js';
 import { fixture, comment, fileScope } from './helpers.mjs';
 
 async function eventually(predicate) {
@@ -14,8 +15,8 @@ async function eventually(predicate) {
   assert.fail('Expected state transition did not complete');
 }
 
-async function wireFixture(t, modern = false, serverOptions = {}) {
-  const fixtureData = await fixture(t);
+async function wireFixture(t, modern = false, serverOptions = {}, engineOptions = {}) {
+  const fixtureData = await fixture(t, engineOptions);
   const stdin = new PassThrough(); const stdout = new PassThrough();
   const messages = []; let partial = ''; const waiters = new Set();
   stdout.on('data', chunk => {
@@ -31,7 +32,7 @@ async function wireFixture(t, modern = false, serverOptions = {}) {
   let nextId = 0;
   const meta = modern ? {
     [PROTOCOL_VERSION_META_KEY]: '2026-07-28',
-    [CLIENT_INFO_META_KEY]: { name: 'figma-listen-test', version: '1' },
+    [CLIENT_INFO_META_KEY]: { name: 'figma-watch-test', version: '1' },
     [CLIENT_CAPABILITIES_META_KEY]: {},
   } : undefined;
   const send = (method, params = {}, id) => {
@@ -55,7 +56,7 @@ async function wireFixture(t, modern = false, serverOptions = {}) {
   if (modern) await request('server/discover');
   else {
     await request('initialize', { protocolVersion: '2025-11-25', capabilities: {},
-      clientInfo: { name: 'figma-listen-test', version: '1' } });
+      clientInfo: { name: 'figma-watch-test', version: '1' } });
     send('notifications/initialized');
   }
   return { ...fixtureData, request, send, wait, handle, messages };
@@ -79,17 +80,17 @@ for (const modern of [false, true]) test(`native-only server exposes no fallback
 for (const modern of [false, true]) test(`tools work over ${modern ? '2026 stateless envelopes' : '2025 initialize'} stdio`, async t => {
   const { request, engine, figma } = await wireFixture(t, modern);
   const listed = await request('tools/list');
-  assert.deepEqual(listed.tools.map(t => t.name).sort(), ['listen_get_events', 'listen_list_subscriptions',
-    'listen_status', 'listen_subscribe', 'listen_unsubscribe']);
+  assert.deepEqual(listed.tools.map(t => t.name).sort(), ['watch_get_events', 'watch_list_subscriptions',
+    'watch_post_comment', 'watch_status', 'watch_subscribe', 'watch_unsubscribe']);
   const catalog = await request('events/list');
   assert.equal(catalog.events[0].name, 'figma.comment.created');
-  const result = await request('tools/call', { name: 'listen_subscribe', arguments: fileScope });
+  const result = await request('tools/call', { name: 'watch_subscribe', arguments: fileScope });
   const data = result.structuredContent ?? JSON.parse(result.content[0].text);
   figma.snapshots.set('fileA', [comment('new', 'Hello #bot')]); await engine.tick();
-  const events = await request('tools/call', { name: 'listen_get_events', arguments: { subscription_id: data.subscription.id } });
+  const events = await request('tools/call', { name: 'watch_get_events', arguments: { subscription_id: data.subscription.id } });
   const batch = events.structuredContent ?? JSON.parse(events.content[0].text);
   assert.equal(batch.events[0].data.comment_id, 'new');
-  await request('tools/call', { name: 'listen_unsubscribe', arguments: { subscription_id: data.subscription.id } });
+  await request('tools/call', { name: 'watch_unsubscribe', arguments: { subscription_id: data.subscription.id } });
   assert.equal(engine.subscriptions().length, 0);
 });
 
@@ -119,7 +120,7 @@ test('stream cancellation preserves a subscription created or promoted by a tool
   const { engine, send, wait, request } = await wireFixture(t);
   send('events/stream', { name: 'figma.comment.created', arguments: fileScope, cursor: null }, 'persistent');
   await wait(m => m.method === 'notifications/events/active');
-  await request('tools/call', { name: 'listen_subscribe', arguments: { ...fileScope, event_types: ['figma.comment.created'] } });
+  await request('tools/call', { name: 'watch_subscribe', arguments: { ...fileScope, event_types: ['figma.comment.created'] } });
   send('notifications/cancelled', { requestId: 'persistent' }); await eventually(() => engine.listenerCount('events') === 0);
   assert.equal(engine.subscriptions()[0].source, 'tool');
 });
@@ -168,4 +169,40 @@ test('design push stream stays silent during edits, then delivers one replayable
   assert.equal(replay.events.length, 1);
   assert.equal(replay.events[0].eventId, pushed.params.eventId);
   send('notifications/cancelled', { requestId: 'designs' }); await eventually(() => engine.listenerCount('events') === 0);
+});
+
+test('comment tool is hidden when the token lacks file_comments:write', async t => {
+  const { request } = await wireFixture(t, false, {}, { commentAccess: 'missing' });
+  assert.equal((await request('tools/list')).tools.some(t => t.name === 'watch_post_comment'), false);
+  const status = await request('tools/call', { name: 'watch_status', arguments: {} });
+  assert.equal(status.structuredContent.comment_access, 'missing');
+  assert.equal(status.structuredContent.comment_tool, null);
+});
+
+for (const modern of [false, true]) test(`an unverified comment tool is withdrawn when Figma rejects a post for scope (${modern ? '2026' : '2025'})`, async t => {
+  const { request, figma, wait } = await wireFixture(t, modern);
+  figma.postError = new FigmaError('Figma HTTP 403. Token is missing a scope this endpoint requires.', 403, 0, ['file_comments:read']);
+  const result = await request('tools/call', { name: 'watch_post_comment', arguments: { file_key: 'fileA', message: 'Hi' } });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /missing a scope/);
+  if (!modern) await wait(m => m.method === 'notifications/tools/list_changed');
+  assert.equal((await request('tools/list')).tools.some(t => t.name === 'watch_post_comment'), false);
+});
+
+test('posting through the tool does not echo back to a push stream, but a reply does', async t => {
+  const { request, send, wait, engine, figma, messages } = await wireFixture(t);
+  send('events/stream', { name: 'figma.comment.created', arguments: fileScope, cursor: null }, 'comments');
+  await wait(m => m.method === 'notifications/events/active');
+  await engine.tick();
+  const posted = await request('tools/call', { name: 'watch_post_comment',
+    arguments: { url: 'https://www.figma.com/design/fileA/Design?node-id=2-1', message: '🤖 Updated the card' } });
+  assert.equal(posted.structuredContent.comment_id, 'posted-1');
+  assert.deepEqual(figma.posted[0].body.client_meta, { node_id: '2:1', node_offset: { x: 0, y: 0 } });
+  await engine.tick();
+  figma.snapshots.get('fileA').push(comment('human', 'Looks good', { parent_id: 'posted-1' }));
+  await engine.tick();
+  const event = await wait(m => m.method === 'notifications/events/event');
+  assert.equal(event.params.data.comment_id, 'human');
+  assert.equal(messages.some(m => m.params?.data?.comment_id === 'posted-1'), false);
+  send('notifications/cancelled', { requestId: 'comments' }); await eventually(() => engine.listenerCount('events') === 0);
 });

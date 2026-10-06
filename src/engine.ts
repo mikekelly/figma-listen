@@ -2,20 +2,20 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { ProtocolError } from '@modelcontextprotocol/server';
 import { FigmaError, indexNodes, type FigmaSource } from './figma.js';
-import { canonical, eventName, subscriptionSchema, tagsIn, targetId, isDesignEvent, reactionSchema,
-  type DesignSnapshot, type Comment, type CommentData, type EventData, type EventName, type EventOccurrence, type Reaction, type Subscription, type SubscriptionArguments } from './schema.js';
+import { canonical, commentInputSchema, eventName, subscriptionSchema, tagsIn, targetId, isDesignEvent, reactionSchema,
+  type CommentAccess, type DesignSnapshot, type Comment, type CommentData, type EventData, type EventName, type EventOccurrence, type Reaction, type Subscription, type SubscriptionArguments } from './schema.js';
 import type { StateStore } from './store.js';
 import { ResourceQueue } from './queue.js';
 import { snapshot, diffNodes, scopeChanges } from './diff.js';
 
-export class ListenError extends ProtocolError {
+export class WatchError extends ProtocolError {
   constructor(message: string, code = -32602) { super(code, message); }
 }
 export interface DeliveryEvent extends Omit<EventOccurrence, 'sequence' | 'observedAt' | 'since' | 'subscriptionId'> { cursor: string }
 export interface EventBatch {
   events: DeliveryEvent[]; cursor: string; hasMore: boolean; truncated: boolean; nextPollMs: number;
 }
-export class ListenEngine extends EventEmitter {
+export class WatchEngine extends EventEmitter {
   private tail: Promise<unknown> = Promise.resolve();
   private timer?: NodeJS.Timeout;
   private stopped = false;
@@ -28,11 +28,54 @@ export class ListenEngine extends EventEmitter {
   private streams = new Map<string, number>();
   private discoveries = new Map<string, { at: number; keys: string[]; warnings: string[] }>();
   private fileNames = new Map<string, string>();
+  private posting = new Map<string, Set<Promise<unknown>>>();
+  private access: CommentAccess;
   constructor(readonly store: StateStore, private readonly figma: FigmaSource, readonly options: {
     pollIntervalMs?: number; designQuietPeriodMs?: number; discoveryIntervalMs?: number; retentionMs?: number; maxEvents?: number;
+    commentAccess?: CommentAccess;
   } = {}) {
     super(); this.setMaxListeners(100);
     store.state.comments ??= {}; store.state.designs ??= {}; store.state.reactions ??= {}; store.state.pendingDesigns ??= {};
+    this.access = figma.postComment ? options.commentAccess ?? 'unverified' : 'missing';
+  }
+  get commentAccess(): CommentAccess { return this.access; }
+  private setCommentAccess(access: CommentAccess): void {
+    if (access !== this.access) { this.access = access; this.emit('commentAccess', access); }
+  }
+  /** Comments posted here are marked seen, so they never come back as events to this process. */
+  async postComment(input: unknown): Promise<{ comment_id: string; thread_id: string; file_key: string;
+    created_at: string; node_id: string | null; url: string }> {
+    const args = commentInputSchema.parse(input);
+    if (!this.figma.postComment || this.access === 'missing')
+      throw new Error('The Figma token lacks the file_comments:write scope.');
+    const key = args.file_key;
+    // Figma only accepts replies to a thread's root comment.
+    const thread = args.reply_to && (this.store.state.comments[key]?.data[args.reply_to]?.thread_id ?? args.reply_to);
+    const request = (async () => {
+      const comment = await this.figma.postComment!(key, { message: args.message,
+        ...(thread ? { comment_id: thread } : {}),
+        ...(args.node_id ? { client_meta: { node_id: args.node_id, node_offset: args.node_offset! } } : {}) });
+      // Recorded before any poll waiting on this request diffs its snapshot.
+      (this.store.state.seen[key] ??= []).push(comment.id);
+      return comment;
+    })();
+    const pending = this.posting.get(key) ?? new Set();
+    pending.add(request); this.posting.set(key, pending);
+    let comment: Comment;
+    try { comment = await request; }
+    catch (error) {
+      if (error instanceof FigmaError && error.grantedScopes && !error.grantedScopes.includes('file_comments:write'))
+        this.setCommentAccess('missing');
+      throw error;
+    } finally {
+      pending.delete(request); if (!pending.size) this.posting.delete(key);
+    }
+    this.setCommentAccess('granted');
+    await this.serialized(() => this.store.save());
+    const nodeId = thread ? this.store.state.comments[key]?.data[thread]?.node_id ?? null : args.node_id ?? null;
+    return { comment_id: comment.id, thread_id: thread || comment.id, file_key: key, created_at: comment.created_at,
+      node_id: nodeId, url: `https://www.figma.com/design/${encodeURIComponent(key)}?${new URLSearchParams({
+        ...(nodeId ? { 'node-id': nodeId } : {}), 'comment-id': comment.id })}` };
   }
   get interval(): number { return this.options.pollIntervalMs ?? 3000; }
   get designQuietPeriod(): number { return this.options.designQuietPeriodMs ?? 120000; }
@@ -42,7 +85,7 @@ export class ListenEngine extends EventEmitter {
   subscriptions(): Subscription[] { return structuredClone(this.store.state.subscriptions); }
   subscription(id: string): Subscription {
     const subscription = this.store.state.subscriptions.find(s => s.id === id);
-    if (!subscription) throw new ListenError('Unknown subscription', -32011);
+    if (!subscription) throw new WatchError('Unknown subscription', -32011);
     return subscription;
   }
   async subscribe(input: unknown, source: Subscription['source'] = 'tool'): Promise<Subscription> {
@@ -51,7 +94,7 @@ export class ListenEngine extends EventEmitter {
     return this.serialized(async () => {
       let subscription = this.store.state.subscriptions.find(s => s.id === id);
       if (!subscription) {
-        if (this.store.state.subscriptions.length >= 100) throw new ListenError('Subscription limit (100) reached', -32013);
+        if (this.store.state.subscriptions.length >= 100) throw new WatchError('Subscription limit (100) reached', -32013);
         subscription = { id, arguments: args, createdAt: new Date().toISOString(),
           startSequence: this.store.state.sequence, source,
           coverage: { file_keys: [], complete: false, warnings: ['Discovery pending'], excluded_unanchored_comments: 0 } };
@@ -97,7 +140,7 @@ export class ListenEngine extends EventEmitter {
       if (epoch !== this.store.state.epoch) return { sequence: this.store.state.droppedThrough, truncated: true };
       if (sequence > this.store.state.sequence) throw new Error();
       return { sequence, truncated: sequence < this.store.state.droppedThrough };
-    } catch { throw new ListenError('Invalid cursor or cursor belongs to a different subscription'); }
+    } catch { throw new WatchError('Invalid cursor or cursor belongs to a different subscription'); }
   }
   private matches(subscription: Subscription, event: EventOccurrence, ignoreAccess = false): boolean {
     if (event.subscriptionId && event.subscriptionId !== subscription.id) return false;
@@ -121,7 +164,7 @@ export class ListenEngine extends EventEmitter {
         [...data.thread_has_tag, ...(data.previous_thread_has_tag ?? [])].includes(tag));
   }
   read(id: string, cursor?: string | null, maxEvents = 50, maxAgeMs?: number): EventBatch {
-    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 100) throw new ListenError('max_events must be between 1 and 100');
+    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 100) throw new WatchError('max_events must be between 1 and 100');
     const subscription = this.subscription(id);
     // The draft's null cursor bootstraps from now. Tool omission replays the subscription's buffer.
     if (cursor === null) return { events: [], cursor: this.cursor(id), hasMore: false, truncated: false, nextPollMs: this.interval };
@@ -328,6 +371,9 @@ export class ListenEngine extends EventEmitter {
          this.wants(key, 'comments').some(s => Date.parse(s.createdAt) > Date.parse(previous.observedAt)))) {
       const file = await this.figma.file(key); index = indexNodes(file.document); fileName = file.name;
     }
+    // The snapshot may already hold a comment this server is posting. Diff once its ID is recorded.
+    const posting = this.posting.get(key);
+    if (posting) await Promise.allSettled(posting);
     await this.serialized(async () => {
       if (this.stopped || !this.wants(key, 'comments').length) return;
       const interested = this.wants(key, 'comments');

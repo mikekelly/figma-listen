@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { StateStore } from '../dist/store.js';
-import { ListenEngine } from '../dist/engine.js';
+import { WatchEngine } from '../dist/engine.js';
 import { FigmaError } from '../dist/figma.js';
 import { tagsIn, eventPayloadSchema } from '../dist/schema.js';
 import { fixture, comment, fileScope } from './helpers.mjs';
@@ -54,7 +54,7 @@ test('durable replay, owner binding, exclusive locking, and retention gaps', asy
   const sub = await engine.subscribe(fileScope);
   const start = engine.cursor(sub.id);
   const duplicate = new StateStore(directory);
-  await assert.rejects(duplicate.open('user'), /Another Figma listen/);
+  await assert.rejects(duplicate.open('user'), /Another Figma watch/);
   figma.snapshots.set('fileA', [comment('a', 'a'), comment('b', 'b'), comment('c', 'c')]);
   await engine.tick();
   assert.equal(engine.read(sub.id, start).truncated, true);
@@ -64,7 +64,7 @@ test('durable replay, owner binding, exclusive locking, and retention gaps', asy
   const other = new StateStore(directory);
   await assert.rejects(other.open('different-user'), /another Figma account/);
   const reopened = new StateStore(directory); await reopened.open('user');
-  const resumed = new ListenEngine(reopened, figma);
+  const resumed = new WatchEngine(reopened, figma);
   t.after(() => resumed.close());
   assert.equal(resumed.read(sub.id, last).events.length, 1);
   await resumed.tick();

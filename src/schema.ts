@@ -13,17 +13,23 @@ const explicitScope = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('organization'), organization_id: id,
     team_ids: z.array(id).min(1).max(100).transform(ids => [...new Set(ids)].sort()) }).strict(),
 ]);
+/** File key and node ID from a figma.com design URL, or null for anything else. */
+export function parseFigmaUrl(value: string): { file_key: string; node_id: string | null } | null {
+  let url: URL;
+  try { url = new URL(value); } catch { return null; }
+  const match = url.pathname.match(/^\/(?:design|file|board|slides)\/([A-Za-z0-9_-]+)(?:\/|$)/);
+  if (url.protocol !== 'https:' || !['figma.com', 'www.figma.com'].includes(url.hostname) || !match) return null;
+  return { file_key: match[1], node_id: url.searchParams.get('node-id') };
+}
 const urlScope = z.object({ kind: z.enum(['file', 'page', 'section', 'frame']), url: z.string().url() }).strict()
   .transform((input, ctx) => {
-    const url = new URL(input.url);
-    const match = url.pathname.match(/^\/(?:design|file|board|slides)\/([A-Za-z0-9_-]+)(?:\/|$)/);
-    const node = url.searchParams.get('node-id');
-    if (url.protocol !== 'https:' || !['figma.com', 'www.figma.com'].includes(url.hostname) || !match ||
-        (input.kind !== 'file' && !node)) {
+    const parsed = parseFigmaUrl(input.url);
+    const node = parsed?.node_id;
+    if (!parsed || (input.kind !== 'file' && !node)) {
       ctx.issues.push({ code: 'custom', input, message: 'Use a Figma file URL; page/section/frame URLs need node-id.' });
       return z.NEVER;
     }
-    return { kind: input.kind, file_key: match[1], ...(input.kind === 'page' ? { page_id: node } :
+    return { kind: input.kind, file_key: parsed.file_key, ...(input.kind === 'page' ? { page_id: node } :
       input.kind !== 'file' ? { node_id: node } : {}) } as z.input<typeof explicitScope>;
   }).pipe(explicitScope);
 export const scopeSchema = z.union([explicitScope, urlScope]);
@@ -43,6 +49,28 @@ export const subscriptionSchema = z.object({
   include_thread_replies: z.boolean().default(false),
 }).strict();
 export type SubscriptionArguments = z.infer<typeof subscriptionSchema>;
+export const commentInputSchema = z.object({
+  file_key: fileKey.optional(), url: z.string().url().optional(),
+  message: z.string().trim().min(1).max(20000),
+  node_id: nodeId.optional(),
+  node_offset: z.object({ x: z.number().finite(), y: z.number().finite() }).strict().optional(),
+  reply_to: id.optional(),
+}).strict().transform((input, ctx) => {
+  const parsed = input.url === undefined ? undefined : parseFigmaUrl(input.url);
+  const fail = (message: string) => { ctx.issues.push({ code: 'custom', input, message }); return z.NEVER; };
+  if ((input.file_key === undefined) === (input.url === undefined)) return fail('Provide exactly one of file_key or url.');
+  if (parsed === null) return fail('Use a Figma file URL.');
+  if (input.reply_to && (input.node_id || input.node_offset)) return fail('Replies take the thread position; omit node_id and node_offset.');
+  // A reply cannot be pinned, so a node in a pasted URL only anchors new threads.
+  const node = input.node_id ?? (input.reply_to ? undefined : parsed?.node_id?.replace(/-/g, ':') ?? undefined);
+  if (input.node_offset && !node) return fail('node_offset needs node_id.');
+  if (node && !id.safeParse(node).success) return fail('Invalid node-id.');
+  return { file_key: input.file_key ?? parsed!.file_key, message: input.message,
+    ...(node ? { node_id: node, node_offset: input.node_offset ?? { x: 0, y: 0 } } : {}),
+    ...(input.reply_to ? { reply_to: input.reply_to } : {}) };
+});
+export type CommentInput = z.infer<typeof commentInputSchema>;
+export type CommentAccess = 'granted' | 'missing' | 'unverified';
 const authorSchema = z.object({ id: z.string(), handle: z.string().optional() }).strict();
 export const reactionSchema = z.object({ user: authorSchema, emoji: z.string(), created_at: z.string() }).strict();
 const locationSchema = z.object({ node_id: z.string().nullable(), page_id: z.string().nullable(),

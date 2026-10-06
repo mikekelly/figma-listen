@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { StateStore } from '../dist/store.js';
-import { ListenEngine } from '../dist/engine.js';
+import { WatchEngine } from '../dist/engine.js';
 import { eventPayloadSchema, subscriptionSchema, eventNames } from '../dist/schema.js';
 import { FigmaError } from '../dist/figma.js';
 import { fixture, comment, fileScope } from './helpers.mjs';
@@ -151,7 +151,7 @@ test('persisted snapshots detect changes after restart without repeating events 
   advance(); edit(d => { d.document.children[0].name = 'Changed offline'; });
   figma.snapshots.set('fileA', [old('root', 'Edited offline')]);
   const store = new StateStore(directory); await store.open('user');
-  const resumed = new ListenEngine(store, figma, { designQuietPeriodMs: 0 }); t.after(() => resumed.close());
+  const resumed = new WatchEngine(store, figma, { designQuietPeriodMs: 0 }); t.after(() => resumed.close());
   await resumed.tick();
   const batch = resumed.read(sub.id, cursor);
   assert.deepEqual(names(batch).sort(), ['figma.comment.edited', 'figma.design.changed']);
@@ -234,7 +234,7 @@ test('v1.1 state migration preserves old comment-only subscriptions and baseline
   delete legacy.subscriptions[0].arguments.event_types;
   await writeFile(join(directory, 'state.json'), JSON.stringify(legacy));
   const migrated = new StateStore(directory); await migrated.open('user');
-  const resumed = new ListenEngine(migrated, figma);
+  const resumed = new WatchEngine(migrated, figma);
   assert.deepEqual(resumed.subscription(sub.id).arguments.event_types, ['figma.comment.created']);
   assert.deepEqual(migrated.state.pendingDesigns, {});
   await resumed.tick(); await resumed.close();
@@ -324,7 +324,7 @@ test('pending changesets survive restart and require a successful read before fl
   t.mock.timers.tick(1000); doc().document.children[0].children[0].name = 'Changed'; await engine.tick();
   await engine.close();
   const reopened = new StateStore(directory); await reopened.open('user');
-  const resumed = new ListenEngine(reopened, figma); t.after(() => resumed.close());
+  const resumed = new WatchEngine(reopened, figma); t.after(() => resumed.close());
   assert.equal(resumed.pollingStatus().pending_design_changesets.length, 1);
   t.mock.timers.tick(120000);
   const readFile = figma.file;

@@ -1,10 +1,17 @@
 import type { Comment, FileNode, FileDocument, FileReference, Reaction, SubscriptionArguments } from './schema.js';
+import { randomUUID } from 'node:crypto';
 import { ResourceQueue } from './queue.js';
 
 export class FigmaError extends Error {
-  constructor(message: string, public readonly status: number, public readonly retryAfterMs = 0) {
+  constructor(message: string, public readonly status: number, public readonly retryAfterMs = 0,
+    /** Scopes Figma reported for the token when it rejected a request for missing scope. */
+    public readonly grantedScopes?: string[]) {
     super(message); this.name = 'FigmaError';
   }
+}
+export interface NewComment {
+  message: string; comment_id?: string;
+  client_meta?: { node_id: string; node_offset: { x: number; y: number } };
 }
 export interface FigmaSource {
   readonly requestIntervalMs?: number;
@@ -15,6 +22,20 @@ export interface FigmaSource {
   metadata(key: string): Promise<{ name: string; version: string }>;
   reactions(key: string, commentId: string): Promise<Reaction[]>;
   discover(scope: SubscriptionArguments['scope']): Promise<{ files: FileReference[]; warnings: string[] }>;
+  postComment?(key: string, comment: NewComment): Promise<Comment>;
+}
+
+/** Figma's 403 for a missing scope lists the scopes the token does have. Keep only that list. */
+function grantedScopes(body: string): string[] | undefined {
+  let message: unknown;
+  try { message = JSON.parse(body)?.message; } catch { return undefined; }
+  const match = typeof message === 'string' && message.match(/Invalid scopes?: (\[[^\]]*\])/);
+  if (!match) return undefined;
+  try {
+    const scopes: unknown = JSON.parse(match[1]);
+    if (Array.isArray(scopes) && scopes.every(scope => typeof scope === 'string' && /^[a-z_]+(:[a-z_]+)?$/.test(scope))) return scopes;
+  } catch { /* An unrecognized message is not a scope report. */ }
+  return undefined;
 }
 
 /** Request starts are paced; slow responses do not serialize other requests. */
@@ -30,14 +51,17 @@ export class FigmaClient implements FigmaSource {
   get requestIntervalMs(): number { return this.options.requestIntervalMs ?? 2000; }
   requestStatus(): ReturnType<ResourceQueue['status']> { return this.requests.status(); }
   close(): void { this.controller.abort(); void this.requests.close(); }
-  async get<T>(path: string): Promise<T> {
+  get<T>(path: string): Promise<T> { return this.request('GET', path); }
+  private async request<T>(method: 'GET' | 'POST', path: string, body?: unknown, paced = true): Promise<T> {
     const base = this.options.baseUrl ?? 'https://api.figma.com';
     const url = new URL(path, base);
     if (url.origin !== new URL(base).origin) throw new Error('Refusing a cross-origin API URL');
-    return this.requests.enqueue(url.href, async () => {
+    const send = async (): Promise<T> => {
       if (this.controller.signal.aborted) throw new Error('Figma client closed');
       const response = await (this.options.fetch ?? fetch)(url, {
-        headers: { 'X-Figma-Token': this.token, Accept: 'application/json' },
+        method, headers: { 'X-Figma-Token': this.token, Accept: 'application/json',
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         redirect: 'error',
         signal: AbortSignal.any([this.controller.signal, AbortSignal.timeout(this.options.timeoutMs ?? 15000)]),
       });
@@ -46,15 +70,35 @@ export class FigmaClient implements FigmaSource {
         const retry = raw ? (Number.isFinite(Number(raw)) ? Number(raw) * 1000 : Date.parse(raw) - Date.now()) : 60000;
         const backoff = response.status === 429 ? Math.max(1000, Number.isFinite(retry) ? retry : 60000) : 0;
         if (backoff) this.requests.pause(backoff);
-        const hint = response.status === 401 || response.status === 403
+        const scopes = response.status === 403 ? grantedScopes((await response.text().catch(() => '')).slice(0, 10000)) : undefined;
+        const hint = scopes ? 'Token is missing a scope this endpoint requires.'
+          : response.status === 401 || response.status === 403
           ? 'Token invalid/expired, missing scope, or resource access denied.'
           : response.status === 429 ? 'Rate limited; respecting Retry-After.'
           : response.status === 404 ? 'Resource not found or inaccessible.' : 'Upstream request failed.';
         // Never include a response body, token, or request headers in an error.
-        throw new FigmaError(`Figma HTTP ${response.status}. ${hint}`, response.status, backoff);
+        throw new FigmaError(`Figma HTTP ${response.status}. ${hint}`, response.status, backoff, scopes);
       }
       return await response.json() as T;
-    });
+    };
+    if (!paced) return send();
+    // Writes are never coalesced with another request for the same URL.
+    return this.requests.enqueue(method === 'GET' ? url.href : `${method} ${url.href} ${randomUUID()}`, send);
+  }
+  /**
+   * Figma has no scope introspection. Probe endpoints that need scopes a typical
+   * token lacks: the rejection lists the granted scopes, and neither probe can
+   * write anything. Null means no probe was rejected for scope, so it's unknown.
+   */
+  async scopes(): Promise<string[] | null> {
+    const probes = [() => this.request('GET', '/v2/webhooks', undefined, false),
+      () => this.request('POST', '/v1/dev_resources', {}, false)];
+    for (const probe of probes) {
+      try { await probe(); } catch (error) {
+        if (error instanceof FigmaError && error.grantedScopes) return error.grantedScopes;
+      }
+    }
+    return null;
   }
   me(): Promise<{ id: string; handle?: string }> { return this.get('/v1/me'); }
   async comments(key: string): Promise<Comment[]> {
@@ -68,6 +112,12 @@ export class FigmaClient implements FigmaSource {
     }
     if (response.comments.length > 100000) throw new Error('Comment snapshot limit (100000) exceeded');
     return response.comments;
+  }
+  async postComment(key: string, comment: NewComment): Promise<Comment> {
+    const result = await this.request<Comment>('POST', `/v1/files/${encodeURIComponent(key)}/comments`, comment);
+    if (typeof result?.id !== 'string' || typeof result.created_at !== 'string')
+      throw new Error('Figma returned an invalid comment');
+    return result;
   }
   async file(key: string): Promise<FileDocument> {
     const file = await this.get<FileDocument>(`/v1/files/${encodeURIComponent(key)}?geometry=paths`);

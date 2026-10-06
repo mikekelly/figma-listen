@@ -1,14 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { StateStore } from '../dist/store.js';
-import { ListenEngine } from '../dist/engine.js';
+import { WatchEngine } from '../dist/engine.js';
 import { FakeFigma, comment, fileScope } from './helpers.mjs';
 
 test('parallel in-memory listeners isolate subscriptions, events and lifecycle', async t => {
   const stores = [new StateStore(), new StateStore()];
   await Promise.all(stores.map(store => store.open('user')));
   const figma = new FakeFigma();
-  const [left, right] = stores.map(store => new ListenEngine(store, figma));
+  const [left, right] = stores.map(store => new WatchEngine(store, figma));
   t.after(() => Promise.all([left.close(), right.close()]));
   const a = await left.subscribe({ ...fileScope, tag: '#left' });
   const b = await right.subscribe({ ...fileScope, tag: '#right' });

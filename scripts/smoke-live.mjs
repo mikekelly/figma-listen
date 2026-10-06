@@ -5,13 +5,13 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 if (!process.env.FIGMA_ACCESS_TOKEN) throw new Error('Export FIGMA_ACCESS_TOKEN first');
-const clients = [1, 2].map(id => new Client({ name: `figma-listen-smoke-${id}`, version: '1' }));
+const clients = [1, 2].map(id => new Client({ name: `figma-watch-smoke-${id}`, version: '1' }));
 try {
   await Promise.all(clients.map(client => client.connect(new StdioClientTransport({ command: process.execPath,
     args: [fileURLToPath(new URL('../dist/cli.js', import.meta.url))],
     env: { FIGMA_ACCESS_TOKEN: process.env.FIGMA_ACCESS_TOKEN }, stderr: 'pipe' }))));
   const statuses = await Promise.all(clients.map(async client => {
-    const result = await client.callTool({ name: 'listen_status', arguments: {} });
+    const result = await client.callTool({ name: 'watch_status', arguments: {} });
     assert.ok(!result.isError);
     const status = result.structuredContent ?? JSON.parse(result.content[0].text);
     assert.equal(status.state_storage, 'memory');

@@ -2,15 +2,15 @@
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
-import { authenticate, credentialEntry, loadToken } from './auth.js';
+import { authenticate, forgetToken, loadToken } from './auth.js';
 import { FigmaClient } from './figma.js';
 import { StateStore } from './store.js';
-import { ListenEngine } from './engine.js';
+import { WatchEngine } from './engine.js';
 import { createServer, VERSION } from './server.js';
 
-const HELP = `Figma listen ${VERSION} — local Figma activity events over MCP stdio
+const HELP = `Figma watch ${VERSION} — local Figma activity events over MCP stdio
 
-Usage: figma-listen [auth|logout|doctor] [options]
+Usage: figma-watch [auth|logout|doctor] [options]
 
   (no command)          Start the stdio MCP server
   auth                  Validate and save a token in the system credential store
@@ -27,8 +27,9 @@ Options:
 
 FIGMA_ACCESS_TOKEN overrides saved credentials.
 State stays in memory by default, independently for each MCP process.
-FIGMA_LISTEN_STATE_DIR also opts into persistent state.
+FIGMA_WATCH_STATE_DIR also opts into persistent state.
 Push requires an MCP Events capable host. Retrieval tools work on ordinary MCP clients.
+watch_post_comment is offered when the token may have the file_comments:write scope.
 `;
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({ allowPositionals: true, options: {
@@ -37,10 +38,10 @@ async function main(): Promise<void> {
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   if (values.version) { process.stdout.write(`${VERSION}\n`); return; }
-  if (positionals.length > 1 || (positionals[0] && !['auth','logout','doctor'].includes(positionals[0]))) throw new Error('Unknown command. Run figma-listen --help.');
+  if (positionals.length > 1 || (positionals[0] && !['auth','logout','doctor'].includes(positionals[0]))) throw new Error('Unknown command. Run figma-watch --help.');
   if (positionals[0] === 'auth') { await authenticate(); return; }
   if (positionals[0] === 'logout') {
-    await (await credentialEntry()).deleteCredential();
+    await forgetToken();
     process.stderr.write('Saved token removed. FIGMA_ACCESS_TOKEN, if set, still takes precedence.\n'); return;
   }
   const interval = Number(values['poll-interval'] ?? 3) * 1000;
@@ -49,14 +50,15 @@ async function main(): Promise<void> {
   const spacing = Number(values['request-interval'] ?? 2000);
   if (!Number.isFinite(interval) || interval < 1000 || interval > 86400000) throw new Error('--poll-interval must be between 1 and 86400 seconds');
   if (!Number.isFinite(spacing) || spacing < 0 || spacing > 60000) throw new Error('--request-interval must be between 0 and 60000 milliseconds');
-  const configuredDirectory = values['state-dir'] ?? process.env.FIGMA_LISTEN_STATE_DIR;
+  const configuredDirectory = values['state-dir'] ?? process.env.FIGMA_WATCH_STATE_DIR ?? process.env.FIGMA_LISTEN_STATE_DIR;
   const directory = configuredDirectory ? resolve(configuredDirectory) : undefined;
   const figma = new FigmaClient(await loadToken(), { requestIntervalMs: spacing });
-  let engine: ListenEngine | undefined;
+  let engine: WatchEngine | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   try {
-    const user = await figma.me();
+    const [user, scopes] = await Promise.all([figma.me(), figma.scopes()]);
     if (typeof user.id !== 'string') throw new Error('Figma returned an invalid authenticated identity');
+    const commentAccess = scopes ? (scopes.includes('file_comments:write') ? 'granted' : 'missing') : 'unverified';
     if (positionals[0] === 'doctor') {
       process.stdout.write(JSON.stringify({ version: VERSION, authenticated: true, user_id: user.id,
         token_source: process.env.FIGMA_ACCESS_TOKEN?.trim() ? 'environment' : 'credential_store',
@@ -64,13 +66,17 @@ async function main(): Promise<void> {
         poll_interval_ms: interval, design_quiet_period_ms: quiet, request_interval_ms: spacing,
         polling_scheduler: 'FIFO; one pending or running job per resource',
         required_scopes: ['current_user:read','file_comments:read'],
-        optional_scopes: ['file_content:read','folders:read'],
+        optional_scopes: ['file_content:read','folders:read','file_comments:write'],
+        token_scopes: scopes ?? 'unverified (no probe was rejected for scope)',
+        ...(scopes ? { missing_required_scopes: ['current_user:read','file_comments:read'].filter(s => !scopes.includes(s)) } : {}),
+        comment_tool: commentAccess === 'missing' ? 'hidden (token lacks file_comments:write)'
+          : commentAccess === 'granted' ? 'watch_post_comment' : 'watch_post_comment (removed if Figma rejects a post for scope)',
         push_compatibility: 'Requires a host implementing the draft MCP Events extension; not verified for Codex.' }, null, 2) + '\n');
       figma.close(); return;
     }
     const store = new StateStore(directory); await store.open(user.id);
-    engine = new ListenEngine(store, figma, { pollIntervalMs: interval, designQuietPeriodMs: quiet });
-    engine.on('pollError', (error: Error) => process.stderr.write(`figma-listen: ${error.message}\n`));
+    engine = new WatchEngine(store, figma, { pollIntervalMs: interval, designQuietPeriodMs: quiet, commentAccess });
+    engine.on('pollError', (error: Error) => process.stderr.write(`figma-watch: ${error.message}\n`));
     let closing = false;
     const handle = serveStdio(() => createServer(engine!));
     shutdown = async () => {
@@ -81,9 +87,9 @@ async function main(): Promise<void> {
     process.once('SIGTERM', stop);
     process.stdin.once('end', stop);
     engine.start();
-    process.stderr.write(`Figma listen ${VERSION} ready (stdio; REST polling).\n`);
+    process.stderr.write(`Figma watch ${VERSION} ready (stdio; REST polling; comment tool ${commentAccess === 'missing' ? 'hidden' : 'offered'}).\n`);
   } catch (error) {
     figma.close(); if (engine) await engine.close(); throw error;
   }
 }
-main().catch(error => { process.stderr.write(`figma-listen: ${error instanceof Error ? error.message : 'Startup failed'}\n`); process.exitCode = 1; });
+main().catch(error => { process.stderr.write(`figma-watch: ${error instanceof Error ? error.message : 'Startup failed'}\n`); process.exitCode = 1; });

@@ -1,8 +1,12 @@
-# Figma listen
+# Figma watch
 
 **A companion to the official Figma MCP for reviewing designs with your agent.**
 
-Your agent updates a design in Figma and gives you a link to check it over in the app. It can then subscribe to activity on the file, page, section or frame it's working on. Leave a comment, react to feedback, resolve a thread, or edit the design yourself. For agents that support MCP Events streams, Figma listen forwards matching comments and reactions as soon as polling detects them and batches design edits until the scope is quiet, letting you collaborate directly in Figma.
+Your agent updates a design in Figma and gives you a link to check it over in the app. It can then subscribe to activity on the file, page, section or frame it's working on. Leave a comment, react to feedback, resolve a thread, or edit the design yourself. For agents that support MCP Events streams, Figma watch forwards matching comments and reactions as soon as polling detects them and batches design edits until the scope is quiet, letting you collaborate directly in Figma.
+
+The agent can reply in Figma too. The official Figma MCP can't post comments; Figma watch can, when your token allows it, and comments the agent posts through it are never delivered back to that agent as events, so its own words don't wake it up.
+
+> Figma watch was previously published as `@realmikekelly/figma-listen`. See [Upgrading from figma-listen](#upgrading-from-figma-listen).
 
 ## Setup
 
@@ -12,14 +16,15 @@ You'll need Node.js **20.19 or newer** and npm.
 
 In Figma, go to **Settings > Security > Personal access tokens > Generate new token**.
 
-- Give it a name, such as **Figma listen**.
+- Give it a name, such as **Figma watch**.
 - Set the expiration to **90 days**.
 - Give it **all the read scopes**.
+- To let the agent comment back, also give it **Comments: write** (`file_comments:write`).
 
 Save your token by running this in your terminal, then paste it into the hidden prompt:
 
 ```sh
-npx -y @realmikekelly/figma-listen auth
+npx -y @realmikekelly/figma-watch auth
 ```
 
 If you already export `FIGMA_ACCESS_TOKEN`, you can use that instead of saving a token with `auth`.
@@ -28,16 +33,16 @@ If you already export `FIGMA_ACCESS_TOKEN`, you can use that instead of saving a
 
 Ask your agent:
 
-> Add Figma listen as a local stdio MCP server in my agent's MCP configuration. Run `npx` with arguments `-y` and `@realmikekelly/figma-listen`.
+> Add Figma watch as a local stdio MCP server in my agent's MCP configuration. Run `npx` with arguments `-y` and `@realmikekelly/figma-watch`.
 
 For clients that use an `mcpServers` JSON configuration:
 
 ```json
 {
   "mcpServers": {
-    "figma_listen": {
+    "figma_watch": {
       "command": "npx",
-      "args": ["-y", "@realmikekelly/figma-listen"]
+      "args": ["-y", "@realmikekelly/figma-watch"]
     }
   }
 }
@@ -48,30 +53,59 @@ The configuration location and format depend on your client. This example uses t
 Check that authentication is working:
 
 ```sh
-npx -y @realmikekelly/figma-listen doctor
+npx -y @realmikekelly/figma-watch doctor
 ```
 
 Once connected, ask your agent to subscribe to the files you're reviewing. For example:
 
-> Use Figma listen to subscribe to comments containing #bot in this Figma file. Include replies to those threads, and check for feedback while we work. Use the official Figma MCP for the design work.
+> Use Figma watch to subscribe to comments containing #bot in this Figma file. Include replies to those threads, and check for feedback while we work. Use the official Figma MCP for the design work, and reply to my comments with Figma watch.
+
+## Upgrading from figma-listen
+
+Version 2.0 renamed the package, command and tools:
+
+| Before | After |
+| --- | --- |
+| `@realmikekelly/figma-listen` | `@realmikekelly/figma-watch` |
+| `figma-listen` command | `figma-watch` |
+| `listen_subscribe`, `listen_get_events`, … | `watch_subscribe`, `watch_get_events`, … |
+| `FIGMA_LISTEN_STATE_DIR` | `FIGMA_WATCH_STATE_DIR` (the old name still works) |
+
+Point your MCP configuration at the new package and rename the server entry if you like. A token saved by `figma-listen auth` is found and copied automatically; you don't need to run `auth` again. Update any prompts or agent instructions that name the old tools.
 
 ## Notification support
 
-Figma listen checks for activity on a **three-second target interval**, subject to request pacing and Figma's rate limits. Comments and reactions are delivered as soon as polling detects a matching change. Design edits are collected into a changeset and delivered after **120 seconds without an observed design change in the subscribed scope**.
+Figma watch checks for activity on a **three-second target interval**, subject to request pacing and Figma's rate limits. Comments and reactions are delivered as soon as polling detects a matching change. Design edits are collected into a changeset and delivered after **120 seconds without an observed design change in the subscribed scope**.
 
 Automatic notifications require an agent host that implements the experimental MCP Events streaming extension: it must open an `events/stream` request and handle the resulting notifications. Whether an event wakes an idle agent depends on the host. A stdio connection alone does not provide that behavior.
 
-Clients without event-stream support can use `listen_subscribe` and `listen_get_events` to retrieve feedback during an active session. Those tools do not establish a push stream.
+Clients without event-stream support can use `watch_subscribe` and `watch_get_events` to retrieve feedback during an active session. Those tools do not establish a push stream.
 
-Figma listen runs locally and polls Figma's REST API, delivering events over MCP stdio. It observes comments, reactions and design changes; the agent uses the official Figma MCP for design work and decides how to act on feedback.
+Figma watch runs locally and polls Figma's REST API, delivering events over MCP stdio. It observes comments, reactions and design changes and can post comments; the agent uses the official Figma MCP for design work and decides how to act on feedback.
+
+## Commenting
+
+With the `file_comments:write` scope, the agent gets a `watch_post_comment` tool:
+
+```json
+{ "url": "https://www.figma.com/design/YOUR_FILE_KEY/Design?node-id=12-34", "message": "🤖 Tightened the spacing on this card" }
+```
+
+- Give `file_key` or a Figma URL. A `node_id`, or a URL with `node-id`, pins a new thread to that node; `node_offset` `{ "x": 0, "y": 0 }` positions the pin relative to the node's top-left.
+- `reply_to` replies to a thread. It accepts the ID of any comment in the thread and replies to the thread's root, as Figma requires. Replies can't be pinned, so a URL's `node-id` is ignored for a reply.
+- The comment is posted as the token's account, so it looks like it came from you. Prefixing messages with 🤖 tells people which comments came from the agent.
+
+**No self-echo.** Your token is the agent's identity, so the server can't tell the agent's comments from yours by author. Instead it records the ID of every comment it posts. That comment never becomes a `figma.comment.created` event in the process that posted it, even if a poll observes it before Figma's response arrives. Replies, reactions, edits and resolutions from people still arrive as usual. Comments posted by other tools, or by another agent's Figma watch process, are delivered normally.
+
+**Scope detection.** Figma has no endpoint that lists a token's scopes. At startup, Figma watch makes requests that a typical token isn't allowed to make: `GET /v2/webhooks`, then, if needed, `POST /v1/dev_resources` with an empty body, which can't create anything. Figma's rejection lists the token's granted scopes. If `file_comments:write` isn't among them, `watch_post_comment` isn't offered. If neither request is rejected for scope, the token has broad write scopes, so the tool is offered; if Figma then rejects a post for missing scope, the tool is removed and a `notifications/tools/list_changed` notification is sent. `doctor` reports the detected scopes and whether the tool is offered. This relies on the wording of Figma's error message, which isn't a documented API.
 
 ## Authentication details
 
 The `auth` command validates your token and saves it in macOS Keychain, Windows Credential Manager, or Linux Secret Service. Linux requires an available Secret Service; environment authentication also works without the optional keyring dependency.
 
-The `FIGMA_ACCESS_TOKEN` environment variable takes precedence over a saved credential. Figma listen uses the environment token without copying it into its config or state files. `logout` removes the saved credential and leaves environment configuration alone. When your token expires, replace the environment value or run `auth` again.
+The `FIGMA_ACCESS_TOKEN` environment variable takes precedence over a saved credential. Figma watch uses the environment token without copying it into its config or state files. `logout` removes the saved credential and leaves environment configuration alone. When your token expires, replace the environment value or run `auth` again.
 
-All available read scopes work. If you prefer to select only the scopes used by Figma listen:
+All available read scopes work; add `file_comments:write` to enable commenting. If you prefer to select only the scopes used by Figma watch:
 
 | Scope | Used for |
 | --- | --- |
@@ -79,6 +113,7 @@ All available read scopes work. If you prefer to select only the scopes used by 
 | `file_comments:read` | Reading comments and replies |
 | `file_content:read` | Design snapshots and mapping comments into page/section/frame scopes |
 | `folders:read` | Discovering files in folders and teams |
+| `file_comments:write` | Optional: `watch_post_comment` |
 
 Access is limited to resources visible to the token's account. The official Figma MCP's OAuth credentials are managed separately and are not reused by this server.
 
@@ -87,35 +122,35 @@ Access is limited to resources visible to the token's account. The official Figm
 Run the npm package directly with `npx`:
 
 ```sh
-npx -y @realmikekelly/figma-listen --help
+npx -y @realmikekelly/figma-watch --help
 ```
 
 Or install it globally:
 
 ```sh
-npm install -g @realmikekelly/figma-listen
-figma-listen --help
+npm install -g @realmikekelly/figma-watch
+figma-watch --help
 ```
 
-With no subcommand, `figma-listen` starts the MCP server. Help, version, and doctor output go to stdout; while serving MCP, stdout contains only protocol messages and diagnostics go to stderr.
+With no subcommand, `figma-watch` starts the MCP server. Help, version, and doctor output go to stdout; while serving MCP, stdout contains only protocol messages and diagnostics go to stderr.
 
 For a local checkout:
 
 ```sh
-git clone https://github.com/mikekelly/figma-listen.git
-cd figma-listen
+git clone https://github.com/mikekelly/figma-watch.git
+cd figma-watch
 npm ci
 node dist/cli.js doctor
 node dist/cli.js
 ```
 
-`npm ci` builds the TypeScript source. Compiled tarballs are also available from [GitHub releases](https://github.com/mikekelly/figma-listen/releases).
+`npm ci` builds the TypeScript source. Compiled tarballs are also available from [GitHub releases](https://github.com/mikekelly/figma-watch/releases).
 
 ## Process configuration
 
 When using environment authentication, `FIGMA_ACCESS_TOKEN` must be available to the MCP process. A desktop app launched outside your terminal may not inherit your shell environment; saved credential authentication avoids that dependency. Do not put your token into command arguments or checked-in config.
 
-For the checkout at `~/code/figma-listen`, you can instead use an absolute path to Node and the built `dist/cli.js`. Run `which node` to find your Node executable; MCP processes do not expand `~` in arguments.
+For the checkout at `~/code/figma-watch`, you can instead use an absolute path to Node and the built `dist/cli.js`. Run `which node` to find your Node executable; MCP processes do not expand `~` in arguments.
 
 Each agent gets an independent MCP process with in-memory state by default. Parallel agents need no extra configuration. Subscriptions, snapshots, buffered events and pending design batches end when their process exits; the agent must subscribe again after restarting. Polling, deduplication and backoff are shared within each process, not across agents. Multiple agents watching the same file make independent requests.
 
@@ -124,12 +159,12 @@ If you explicitly want restart recovery, opt into disk persistence. Use a differ
 Set the server's `args` to:
 
 ```json
-["-y", "@realmikekelly/figma-listen", "--state-dir", "/absolute/path/to/session-state"]
+["-y", "@realmikekelly/figma-watch", "--state-dir", "/absolute/path/to/session-state"]
 ```
 
 ## Subscriptions
 
-Call `listen_subscribe` with a scope, optional event types and optional comment tag:
+Call `watch_subscribe` with a scope, optional event types and optional comment tag:
 
 ```json
 {
@@ -184,9 +219,9 @@ Each subscription has a **120-second quiet timer**. Every observed design change
 
 A flush emits one `figma.design.changed` event per changed file, with the net difference from before the collected edits to the latest observed state. Repeated edits collapse; fully reverted edits and temporary additions/deletions disappear from the result. A target that is deleted and restored during the window does not produce `figma.scope.deleted`. The payload includes `first_observed_at`, `last_observed_at`, and `quiet_period_ms`. Pending changesets are discarded on unsubscribe; they survive restarts only when disk persistence is configured. Overlapping subscriptions maintain independent timers and baselines.
 
-Use `--design-quiet SECS` to change the quiet period (default `120`; `0` delivers each observed delta immediately). `listen_status` reports pending changesets and their earliest eligible flush time. The agent does not receive intermediate design deltas. Comments and reactions continue to arrive promptly while a changeset is pending.
+Use `--design-quiet SECS` to change the quiet period (default `120`; `0` delivers each observed delta immediately). `watch_status` reports pending changesets and their earliest eligible flush time. The agent does not receive intermediate design deltas. Comments and reactions continue to arrive promptly while a changeset is pending.
 
-Figma's current version is mutable: edits can change its contents without changing its ID. Figma listen compares document snapshots on each design poll; version history does not determine the batch boundaries.
+Figma's current version is mutable: edits can change its contents without changing its ID. Figma watch compares document snapshots on each design poll; version history does not determine the batch boundaries.
 
 Tool subscriptions live in the MCP process by default. With explicit disk persistence, subscriptions and snapshots survive restarts. New comments are collected from subscription creation time. Existing comments, reactions and designs establish a baseline on the first successful poll; historical edits are not reconstructed. With disk persistence, subsequent snapshot differences are also detected across restarts. A newly added subscription also baselines existing shared snapshots before receiving differences. Upgrading v1.1 state preserves existing subscriptions as **new-comments-only**; create a new subscription to select the additional event types.
 
@@ -194,13 +229,14 @@ Tool subscriptions live in the MCP process by default. With explicit disk persis
 
 | Tool | Purpose |
 | --- | --- |
-| `listen_subscribe` | Create an idempotent local subscription; return ID and starting cursor |
-| `listen_list_subscriptions` | List subscriptions, discovery coverage, warnings, and upstream errors |
-| `listen_get_events` | Read a subscription's buffer with `subscription_id`, optional `cursor`, and `max_events` (1–100) |
-| `listen_unsubscribe` | Stop a subscription and its active streams |
-| `listen_status` | Inspect polling, retention, supported events, and compatibility limitations |
+| `watch_subscribe` | Create an idempotent local subscription; return ID and starting cursor |
+| `watch_list_subscriptions` | List subscriptions, discovery coverage, warnings, and upstream errors |
+| `watch_get_events` | Read a subscription's buffer with `subscription_id`, optional `cursor`, and `max_events` (1–100) |
+| `watch_unsubscribe` | Stop a subscription and its active streams |
+| `watch_status` | Inspect polling, retention, supported events, comment access, and compatibility limitations |
+| `watch_post_comment` | Post a comment or reply; offered only when the token may have `file_comments:write` (see [Commenting](#commenting)) |
 
-For `listen_get_events`, omit `cursor` on the first call to retrieve events since subscription creation, then pass the returned cursor on later calls. An explicit `null` cursor starts from **now**, returning an empty bootstrap batch. When `hasMore` is true, read another batch using its cursor.
+For `watch_get_events`, omit `cursor` on the first call to retrieve events since subscription creation, then pass the returned cursor on later calls. An explicit `null` cursor starts from **now**, returning an empty bootstrap batch. When `hasMore` is true, read another batch using its cursor.
 
 Events contain a stable `eventId`, name, timestamp, cursor, file key and Figma URL. Comment events include text, the comment author and thread/anchor context; reaction events also include the reacting user and emoji. The comment author is not necessarily the person who edited or resolved it. Change timestamps are observation times unless Figma supplies a creation time; design edits are not attributed to a person. Treat all event content, including node names and comment text, as external data rather than agent instructions.
 
@@ -241,8 +277,8 @@ This is a draft extension, not an assertion that every MCP host supports it. See
 - HTTP **429** pauses the shared HTTP dispatch queue for `Retry-After`; already sent requests may finish, and pending jobs keep their FIFO order. Individual failed file/discovery jobs also retry with exponential backoff, capped at 15 minutes, and reset after a successful attempt. Healthy resources keep running unless a global rate-limit pause applies. Folder discovery refreshes on a five-minute target.
 - `--poll-interval SECS` changes the desired interval (minimum **1 second**). `--request-interval MS` changes global request-start spacing. For example, `--poll-interval 3 --request-interval 1000` targets three seconds while allowing up to one request start per second; use a rate appropriate to your Figma allowance. The desired interval does not override request pacing, concurrency limits, or backoff.
 - Figma publishes PAT limits, but the budget is shared **per user and resource plan**, not independently per token. Comments/reactions are Tier 2; design document reads are Tier 1; limits depend on the seat type and the plan containing the file. Other tools or server processes using that account can consume the same budget. See [Figma rate limits](https://developers.figma.com/docs/rest-api/rate-limits/).
-- `listen_status` exposes the desired interval, resource queue depth, active resources, coalesced job count, and the upstream dispatch queue's concurrency and backoff deadline. Coverage reports the most recent successful poll for each subscription.
-- State stays in memory by default; no state file or lock is created. `--state-dir` or `FIGMA_LISTEN_STATE_DIR` explicitly enables persistence. One process owns each configured directory, tied to the authenticated Figma account. Existing default state from earlier releases is left untouched and is not automatically loaded; pass its directory explicitly if you want to restore it.
+- `watch_status` exposes the desired interval, resource queue depth, active resources, coalesced job count, and the upstream dispatch queue's concurrency and backoff deadline. Coverage reports the most recent successful poll for each subscription.
+- State stays in memory by default; no state file or lock is created. `--state-dir` or `FIGMA_WATCH_STATE_DIR` (or the older `FIGMA_LISTEN_STATE_DIR`) explicitly enables persistence. One process owns each configured directory, tied to the authenticated Figma account. Existing default state from earlier releases is left untouched and is not automatically loaded; pass its directory explicitly if you want to restore it.
 - The state contains comment/reaction snapshots, node names and hierarchy, design property hashes, pending changesets, subscriptions, seen IDs, and cursors; **never the token**. When persistence is enabled, state files use mode `0600`, newly created state directories `0700`, and writes use atomic rename.
 - The event buffer retains up to **7 days / 10,000 events**, whichever limit comes first, within the process lifetime unless disk persistence is enabled. Cursors crossing a retention boundary report `truncated: true`; consumers should report the gap rather than assume complete delivery. Observed IDs survive event eviction so retained comments do not reappear as new events.
 - Discovery is capped at 1,000 folders, 500 files per subscription, 100 subscriptions, and 100,000 observed comment IDs per file. Document snapshots are capped at 100,000 nodes and 200 hierarchy levels. Reaction fallback is capped at 1,000 matching comments per file and 100 pagination cursors per comment. Narrow overly broad scopes or event selections when a limit is reported.
@@ -263,7 +299,7 @@ npm pack
 node scripts/smoke-live.mjs
 ```
 
-Automated tests cover comment lifecycle and reaction deltas, design property diffs, scope movement/deletion, URL scopes, baseline migration and restart replay, paginated reactions, event type selection, filtering, shared polling/discovery, nonblocking FIFO dispatch, bounded concurrency, duplicate coalescing, independent scheduling during slow requests, responsive subscription tools, rate-limit and exponential backoff, authentication error redaction, persistence, retention, both MCP handshake generations, push notifications, replay, and cancellation. CI checks Node 20, 22, and 24. Live testing verified authentication, MCP tool discovery/subscription creation, new comments and untagged replies, comment edits/deletions/resolution/reopening, and reaction additions/removals. Live file-level design changes were also detected, including metadata lag and mutable current version IDs. Those findings are covered by regression tests; design detection now compares full snapshots. Automated tests also cover the 120-second quiet boundary, scope isolation, net reverts, restart persistence, failure recovery, overlapping subscriptions and multi-file batches. A subsequent v1.3.0 live test used the official Figma plugin for edits and the Figma desktop UI for a comment: a real stdio MCP Events client received the comment in 1.1 seconds, two same-version edits as one changeset after 122.6 seconds of quiet, and target deletion after 124.6 seconds. Out-of-scope edits did not reset the timer, and an untouched frame received no design events. Temporary shapes were removed and the test comment resolved. Page/section filtering retains automated coverage; frame filtering and deletion now also have live coverage.
+Automated tests cover comment posting, scope detection and self-echo suppression (including a poll that lands before the post's response), comment lifecycle and reaction deltas, design property diffs, scope movement/deletion, URL scopes, baseline migration and restart replay, paginated reactions, event type selection, filtering, shared polling/discovery, nonblocking FIFO dispatch, bounded concurrency, duplicate coalescing, independent scheduling during slow requests, responsive subscription tools, rate-limit and exponential backoff, authentication error redaction, persistence, retention, both MCP handshake generations, push notifications, replay, and cancellation. CI checks Node 20, 22, and 24. Live testing verified authentication, MCP tool discovery/subscription creation, new comments and untagged replies, comment edits/deletions/resolution/reopening, and reaction additions/removals. Live file-level design changes were also detected, including metadata lag and mutable current version IDs. Those findings are covered by regression tests; design detection now compares full snapshots. Automated tests also cover the 120-second quiet boundary, scope isolation, net reverts, restart persistence, failure recovery, overlapping subscriptions and multi-file batches. A subsequent v1.3.0 live test used the official Figma plugin for edits and the Figma desktop UI for a comment: a real stdio MCP Events client received the comment in 1.1 seconds, two same-version edits as one changeset after 122.6 seconds of quiet, and target deletion after 124.6 seconds. Out-of-scope edits did not reset the timer, and an untouched frame received no design events. Temporary shapes were removed and the test comment resolved. Page/section filtering retains automated coverage; frame filtering and deletion now also have live coverage.
 
 API references: [files](https://developers.figma.com/docs/rest-api/file-endpoints/), [comments](https://developers.figma.com/docs/rest-api/comments-endpoints/), [folders](https://developers.figma.com/docs/rest-api/folders-endpoints/), [scopes](https://developers.figma.com/docs/rest-api/scopes/), [rate limits](https://developers.figma.com/docs/rest-api/rate-limits/).
 

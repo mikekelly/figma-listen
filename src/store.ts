@@ -38,7 +38,7 @@ export class StateStore {
       let alive = true;
       try { process.kill(pid, 0); } catch (failure) { alive = (failure as NodeJS.ErrnoException).code !== 'ESRCH'; }
       if (alive || !Number.isSafeInteger(pid) || pid <= 0) throw new Error(
-        'Another Figma listen process owns this state directory. Use --state-dir for a separate client.');
+        'Another Figma watch process owns this state directory. Use --state-dir for a separate client.');
       await unlink(lockPath);
       const handle = await open(lockPath, 'wx', 0o600);
       await handle.writeFile(String(process.pid)); await handle.close(); this.locked = true;
